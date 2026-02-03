@@ -273,6 +273,21 @@ else
     [[ -f "$f" ]] || continue
     fixup_macho "$f"
   done
+
+  # Sign camlibs after modifying them (install_name_tool invalidates signatures).
+  # Without this, macOS will reject the .so files at runtime with SIGKILL.
+  say "Signing camlibs"
+  while IFS= read -r bundle; do
+    [[ -f "$bundle" ]] || continue
+    /usr/bin/codesign --force --sign "${CODESIGN_IDENTITY:--}" "$bundle" || true
+  done < <(find "$CAMLIBS_DST" -type f \( -name '*.so' -o -name '*.dylib' \) -print 2>/dev/null)
 fi
+
+# Sign all bundled dylibs (install_name_tool invalidates their signatures).
+say "Signing bundled dylibs"
+for f in "$FW_DIR"/*.dylib; do
+  [[ -f "$f" ]] || continue
+  /usr/bin/codesign --force --sign "${CODESIGN_IDENTITY:--}" "$f" || true
+done
 
 say "Bundled libgphoto2 into: $APP_DIR"
