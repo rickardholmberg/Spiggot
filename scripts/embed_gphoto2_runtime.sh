@@ -65,8 +65,63 @@ list_non_system_deps() {
   /usr/bin/otool -L "$file" \
     | tail -n +2 \
     | awk '{print $1}' \
-    | grep -E '^/opt/homebrew/|^/usr/local/' \
+    | grep -E '^/opt/homebrew/|^/usr/local/|^@rpath/' \
+    | grep -v '^@rpath/' \
     || true
+}
+
+# Additional runtime libraries that may be loaded dynamically by libgphoto2's
+# camlibs or image-processing code. These are not always visible via otool -L
+# because they can be dlopen'd at runtime. We enumerate known Homebrew deps.
+EXTRA_RUNTIME_LIBS=(
+  # Image format support (used by various camlibs for RAW/JPEG/etc processing)
+  "libjpeg"
+  "libpng"
+  "libtiff"
+  "libwebp"
+  "libavif"
+  "libaom"
+  "libdav1d"
+  "libvmaf"
+  # Compression (transitive deps of image libs)
+  "liblzma"
+  "libzstd"
+  "libbrotli"
+  # Font/text (sometimes pulled in by EXIF/metadata handling)
+  "libfontconfig"
+  "libfreetype"
+  # RAW image processing
+  "libraw"
+  "liblcms2"
+  # XML (EXIF/metadata)
+  "libexif"
+  "libxml2"
+)
+
+copy_extra_runtime_libs() {
+  local brew_lib_dir=""
+  if command -v brew >/dev/null 2>&1; then
+    brew_lib_dir="$(brew --prefix)/lib"
+  elif [[ -d /opt/homebrew/lib ]]; then
+    brew_lib_dir="/opt/homebrew/lib"
+  elif [[ -d /usr/local/lib ]]; then
+    brew_lib_dir="/usr/local/lib"
+  fi
+
+  [[ -n "$brew_lib_dir" && -d "$brew_lib_dir" ]] || return 0
+
+  for lib_base in "${EXTRA_RUNTIME_LIBS[@]}"; do
+    # Find the newest versioned dylib for this library
+    local found_lib
+    found_lib="$(ls -1 "$brew_lib_dir/${lib_base}"*.dylib 2>/dev/null | grep -E '\.([0-9]+\.)*dylib$' | head -n 1 || true)"
+    if [[ -z "$found_lib" ]]; then
+      # Try without version number
+      found_lib="$(ls -1 "$brew_lib_dir/${lib_base}.dylib" 2>/dev/null | head -n 1 || true)"
+    fi
+    if [[ -n "$found_lib" && -f "$found_lib" ]]; then
+      copy_if_missing "$found_lib" "$FW_DIR"
+    fi
+  done
 }
 
 # Some gphoto2 deps can be in other brew prefixes (e.g. libusb). We just copy any
@@ -123,6 +178,19 @@ copy_transitive_deps "$APP_EXE"
 
 # Also recursively copy deps of anything we just copied.
 # (Simple fixed-point iteration; repo is small so we keep it straightforward.)
+for _ in 1 2 3; do
+  for f in "$FW_DIR"/*.dylib; do
+    [[ -f "$f" ]] || continue
+    copy_transitive_deps "$f"
+  done
+done
+
+# Copy extra runtime libraries that may be dlopen'd by camlibs at runtime.
+# These aren't visible via otool -L but are required for image processing.
+say "Copying extra runtime libraries (image processing, compression, etc.)"
+copy_extra_runtime_libs
+
+# Copy transitive deps of the extra runtime libs we just added
 for _ in 1 2 3; do
   for f in "$FW_DIR"/*.dylib; do
     [[ -f "$f" ]] || continue
