@@ -1,0 +1,56 @@
+name: Release (macOS)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install build dependencies (Homebrew)
+        run: |
+          brew update
+          brew install libgphoto2
+
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build distributable zip
+        shell: bash
+        env:
+          CI: true
+          VERSION: ${{ steps.ver.outputs.tag }}
+          MARKETING_VERSION_OVERRIDE: ${{ steps.ver.outputs.version }}
+          CURRENT_PROJECT_VERSION_OVERRIDE: ${{ steps.ver.outputs.version }}
+        run: |
+          bash scripts/package_release_zip.sh
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Spiggot ${{ steps.ver.outputs.tag }}
+          tag_name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/Spiggot-macOS-${{ steps.ver.outputs.tag }}.zip
