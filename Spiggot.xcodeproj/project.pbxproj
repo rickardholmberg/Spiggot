@@ -11,6 +11,7 @@
 		1A0000000000000000000002 /* CameraCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000012 /* CameraCapture.swift */; };
 		1A0000000000000000000007 /* SettingsWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000019 /* SettingsWindowController.swift */; };
 		1A0000000000000000000080 /* OBSVirtualCameraOutput.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000081 /* OBSVirtualCameraOutput.swift */; };
+		1A0000000000000000000082 /* CropOverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000083 /* CropOverlayView.swift */; };
 		1A0000000000000000000003 /* MainMenu.xib in Resources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000013 /* MainMenu.xib */; };
 		1A0000000000000000000004 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000014 /* Assets.xcassets */; };
 		1A0000000000000000000070 /* Licenses.txt in Resources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000071 /* Licenses.txt */; };
@@ -39,6 +40,7 @@
 		1A0000000000000000000012 /* CameraCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraCapture.swift; sourceTree = "<group>"; };
 		1A0000000000000000000019 /* SettingsWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsWindowController.swift; sourceTree = "<group>"; };
 		1A0000000000000000000081 /* OBSVirtualCameraOutput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OBSVirtualCameraOutput.swift; sourceTree = "<group>"; };
+		1A0000000000000000000083 /* CropOverlayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CropOverlayView.swift; sourceTree = "<group>"; };
 		1A0000000000000000000013 /* MainMenu.xib */ = {isa = PBXFileReference; lastKnownFileType = file.xib; path = MainMenu.xib; sourceTree = "<group>"; };
 		1A0000000000000000000014 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		1A0000000000000000000015 /* Syphon.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Syphon.framework; path = Frameworks/Syphon.framework; sourceTree = "<group>"; };
@@ -77,6 +79,7 @@
 				1A0000000000000000000012 /* CameraCapture.swift */,
 				1A0000000000000000000019 /* SettingsWindowController.swift */,
 				1A0000000000000000000081 /* OBSVirtualCameraOutput.swift */,
+				1A0000000000000000000083 /* CropOverlayView.swift */,
 				1A0000000000000000000016 /* BridgingHeader.h */,
 				1A0000000000000000000013 /* MainMenu.xib */,
 				1A0000000000000000000014 /* Assets.xcassets */,
@@ -218,6 +221,7 @@
 				1A0000000000000000000002 /* CameraCapture.swift in Sources */,
 				1A0000000000000000000007 /* SettingsWindowController.swift in Sources */,
 				1A0000000000000000000080 /* OBSVirtualCameraOutput.swift in Sources */,
+				1A0000000000000000000082 /* CropOverlayView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
