@@ -1,7 +1,12 @@
 import Cocoa
 
-final class SettingsWindowController: NSWindowController {
+final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private weak var cameraCapture: CameraCapture?
+
+    private let cropHeaderLabel = NSTextField(labelWithString: "Crop")
+    private let cropImageView = NSImageView(frame: .zero)
+    private let cropOverlayView = CropOverlayView(frame: .zero)
+    private let resetCropButton = NSButton(title: "Reset Crop", target: nil, action: nil)
 
     private let cameraPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let refreshButton = NSButton(title: "Refresh", target: nil, action: nil)
@@ -24,7 +29,7 @@ final class SettingsWindowController: NSWindowController {
         self.cameraCapture = cameraCapture
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 620, height: 560),
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 860),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -33,6 +38,7 @@ final class SettingsWindowController: NSWindowController {
         window.isReleasedWhenClosed = false
 
         super.init(window: window)
+        window.delegate = self
 
         buildUI()
         refreshCameras()
@@ -43,6 +49,32 @@ final class SettingsWindowController: NSWindowController {
         fatalError("init(coder:) has not been implemented")
     }
 
+    override func showWindow(_ sender: Any?) {
+        super.showWindow(sender)
+
+        // Re-derive the aspect lock each time Settings is opened, in case
+        // OBS output was toggled while it was closed. Snaps rather than
+        // resets, so an existing crop isn't discarded.
+        cropOverlayView.setDesiredPixelAspectRatio(cameraCapture?.requiredCropAspectRatio)
+
+        cameraCapture?.onPreviewFrame = { [weak self] cgImage in
+            guard let self else { return }
+            self.cropImageView.image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+            if cgImage.height > 0 {
+                self.cropOverlayView.setSourceAspectRatio(CGFloat(cgImage.width) / CGFloat(cgImage.height))
+            }
+        }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        cameraCapture?.onPreviewFrame = nil
+    }
+
+    @objc private func resetCropPressed() {
+        cameraCapture?.cropRect = CameraCapture.fullFrameCropRect
+        cropOverlayView.normalizedRect = CameraCapture.fullFrameCropRect
+    }
+
     private func buildUI() {
         guard let contentView = window?.contentView else { return }
 
@@ -51,6 +83,31 @@ final class SettingsWindowController: NSWindowController {
 
         let separator = NSBox()
         separator.boxType = .separator
+
+        let cropSeparator = NSBox()
+        cropSeparator.boxType = .separator
+
+        cropHeaderLabel.font = NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+        cropHeaderLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        cropImageView.translatesAutoresizingMaskIntoConstraints = false
+        cropImageView.imageScaling = .scaleProportionallyUpOrDown
+        cropImageView.wantsLayer = true
+        cropImageView.layer?.backgroundColor = NSColor.black.cgColor
+
+        cropOverlayView.translatesAutoresizingMaskIntoConstraints = false
+        cropOverlayView.wantsLayer = true
+        cropOverlayView.normalizedRect = cameraCapture?.cropRect ?? CameraCapture.fullFrameCropRect
+        cropOverlayView.onRectChanged = { [weak self] rect in
+            self?.cameraCapture?.cropRect = rect
+        }
+
+        resetCropButton.translatesAutoresizingMaskIntoConstraints = false
+        resetCropButton.target = self
+        resetCropButton.action = #selector(resetCropPressed)
+        resetCropButton.bezelStyle = .rounded
+
+        cropSeparator.translatesAutoresizingMaskIntoConstraints = false
 
         cameraPopup.translatesAutoresizingMaskIntoConstraints = false
         cameraLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -105,6 +162,12 @@ final class SettingsWindowController: NSWindowController {
 
         settingsContainer.addSubview(settingsStack)
 
+        contentView.addSubview(cropHeaderLabel)
+        contentView.addSubview(cropImageView)
+        cropImageView.addSubview(cropOverlayView)
+        contentView.addSubview(resetCropButton)
+        contentView.addSubview(cropSeparator)
+
         contentView.addSubview(cameraLabel)
         contentView.addSubview(cameraPopup)
         contentView.addSubview(refreshButton)
@@ -118,8 +181,28 @@ final class SettingsWindowController: NSWindowController {
         contentView.addSubview(applySettingsButton)
 
         NSLayoutConstraint.activate([
+            cropHeaderLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            cropHeaderLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 20),
+
+            cropImageView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            cropImageView.topAnchor.constraint(equalTo: cropHeaderLabel.bottomAnchor, constant: 10),
+            cropImageView.widthAnchor.constraint(equalToConstant: 480),
+            cropImageView.heightAnchor.constraint(equalToConstant: 270),
+
+            cropOverlayView.leadingAnchor.constraint(equalTo: cropImageView.leadingAnchor),
+            cropOverlayView.trailingAnchor.constraint(equalTo: cropImageView.trailingAnchor),
+            cropOverlayView.topAnchor.constraint(equalTo: cropImageView.topAnchor),
+            cropOverlayView.bottomAnchor.constraint(equalTo: cropImageView.bottomAnchor),
+
+            resetCropButton.leadingAnchor.constraint(equalTo: cropImageView.trailingAnchor, constant: 16),
+            resetCropButton.topAnchor.constraint(equalTo: cropImageView.topAnchor),
+
+            cropSeparator.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            cropSeparator.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+            cropSeparator.topAnchor.constraint(equalTo: cropImageView.bottomAnchor, constant: 16),
+
             cameraLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
-            cameraLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 20),
+            cameraLabel.topAnchor.constraint(equalTo: cropSeparator.bottomAnchor, constant: 16),
 
             cameraPopup.leadingAnchor.constraint(equalTo: cameraLabel.trailingAnchor, constant: 12),
             cameraPopup.centerYAnchor.constraint(equalTo: cameraLabel.centerYAnchor),
