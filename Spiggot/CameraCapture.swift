@@ -238,10 +238,14 @@ class CameraCapture {
     }
 
     private func forceStopPTPCameraDaemons() {
-        logVerbose("Killing PTPCamera daemons (best-effort)")
+        // Only kill PTPCamera, not the XPC services that virtual cameras depend on.
+        // ptpcamerad and mscamerad-xpc are used by virtual cameras (OBS, Zoom, etc.)
+        // and killing them breaks those applications.
+        logVerbose("Killing PTPCamera daemon (best-effort)")
         let task = Process()
         task.launchPath = "/usr/bin/killall"
-        task.arguments = ["-9", "PTPCamera", "ptpcamerad", "mscamerad-xpc"]
+        // Only kill "PTPCamera" - removed "ptpcamerad" and "mscamerad-xpc"
+        task.arguments = ["PTPCamera"]
         task.standardError = FileHandle.nullDevice
         task.standardOutput = FileHandle.nullDevice
 
@@ -262,7 +266,11 @@ class CameraCapture {
 
         for attempt in 1...maxAttempts {
             logVerbose("gp_camera_init attempt \(attempt)/\(maxAttempts) (withCameraSession)")
-            forceStopPTPCameraDaemons()
+
+            // Only kill PTPCamera daemon after first attempt fails with USB_CLAIM error
+            if attempt > 1 {
+                forceStopPTPCameraDaemons()
+            }
 
             let ret = gp_camera_init(camera, gpContext)
             if ret >= GP_OK {
@@ -294,9 +302,7 @@ class CameraCapture {
             return .success(body(camera, gpContext))
         }
 
-        forceStopPTPCameraDaemons()
-        Thread.sleep(forTimeInterval: 0.1)
-
+        // Don't preemptively kill camera daemons - let retry logic handle USB_CLAIM errors
         let context = gp_context_new()
         guard let context else {
             return .failure(.message("Failed to create gphoto2 context"))
@@ -1315,9 +1321,7 @@ class CameraCapture {
     }
 
     func listAvailableCameras(includeSerialNumbers: Bool) -> [DetectedCamera] {
-        forceStopPTPCameraDaemons()
-        Thread.sleep(forTimeInterval: 0.1)
-
+        // Don't kill camera daemons just for listing - this breaks virtual cameras
         let context = gp_context_new()
         guard let context else { return [] }
         defer { gp_context_unref(context) }
@@ -1366,7 +1370,11 @@ class CameraCapture {
             if Thread.current.isCancelled { return false }
 
             logVerbose("initializeCameraWithRetries attempt \(attempt)/\(maxAttempts) model=\(model ?? "(nil)") port=\(port ?? "(nil)")")
-            forceStopPTPCameraDaemons()
+
+            // Only kill PTPCamera daemon after first attempt fails with USB_CLAIM error
+            if attempt > 1 {
+                forceStopPTPCameraDaemons()
+            }
 
             // Create a fresh camera per attempt.
             var ret = gp_camera_new(&camera)
@@ -1487,11 +1495,9 @@ class CameraCapture {
             return false
         }
 
-        // Best-effort stop; on modern macOS these daemons tend to respawn quickly,
-        // so actual init uses a small retry loop.
-        forceStopPTPCameraDaemons()
-        Thread.sleep(forTimeInterval: 0.2)
-        
+        // Don't preemptively kill camera daemons - let retry logic handle USB_CLAIM errors
+        // This prevents breaking OBS and other virtual camera systems
+
         // Initialize gphoto2 context
         gpContext = gp_context_new()
         guard let gpContext else {
