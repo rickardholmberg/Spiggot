@@ -132,10 +132,19 @@ final class OBSVirtualCameraOutput {
             .transformed(by: CGAffineTransform(scaleX: CGFloat(scale), y: CGFloat(scale)))
             .transformed(by: CGAffineTransform(translationX: tx, y: ty))
 
+        let canvasRect = CGRect(x: 0, y: 0, width: Self.canvasWidth, height: Self.canvasHeight)
+        // Pooled pixel buffers are recycled, not zeroed -- when `fitted`
+        // doesn't cover the whole canvas (any aspect ratio other than
+        // exactly 16:9), the uncovered letterbox/pillarbox area must be
+        // explicitly painted black, or it shows whatever garbage was left
+        // over from a previous frame's contents in that buffer.
+        let background = CIImage(color: .black).cropped(to: canvasRect)
+        let composited = fitted.composited(over: background)
+
         ciContext.render(
-            fitted,
+            composited,
             to: pixelBuffer,
-            bounds: CGRect(x: 0, y: 0, width: Self.canvasWidth, height: Self.canvasHeight),
+            bounds: canvasRect,
             colorSpace: CGColorSpaceCreateDeviceRGB()
         )
 
