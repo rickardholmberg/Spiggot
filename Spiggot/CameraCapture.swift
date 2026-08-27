@@ -161,6 +161,8 @@ class CameraCapture {
         static let selectedCameraSerial = "SelectedCameraSerial"
         static let selectedCameraModel = "SelectedCameraModel"
         static let autofocusHoldSeconds = "AutofocusHoldSeconds"
+        static let syphonOutputEnabled = "SyphonOutputEnabled"
+        static let obsOutputEnabled = "OBSOutputEnabled"
     }
 
     private enum AutofocusTiming {
@@ -183,6 +185,7 @@ class CameraCapture {
     private var camera: UnsafeMutablePointer<Camera>?
     private var gpContext: OpaquePointer?
     private var syphonServer: SyphonMetalServer?
+    private let obsOutput = OBSVirtualCameraOutput()
     private var device: MTLDevice?
     private var commandQueue: MTLCommandQueue?
     private var ciContext: CIContext?
@@ -235,6 +238,25 @@ class CameraCapture {
             let clamped = AutofocusHoldPreference.clamp(newValue)
             UserDefaults.standard.set(clamped, forKey: DefaultsKeys.autofocusHoldSeconds)
         }
+    }
+
+    /// Whether frames are published to Syphon. Defaults to on to preserve
+    /// existing behavior for users upgrading from before this setting existed.
+    var syphonOutputEnabled: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: DefaultsKeys.syphonOutputEnabled) == nil {
+                return true
+            }
+            return UserDefaults.standard.bool(forKey: DefaultsKeys.syphonOutputEnabled)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: DefaultsKeys.syphonOutputEnabled) }
+    }
+
+    /// Whether frames are published to OBS Studio's virtual camera. Defaults
+    /// to off since it requires OBS to already be installed and run once.
+    var obsOutputEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: DefaultsKeys.obsOutputEnabled) }
+        set { UserDefaults.standard.set(newValue, forKey: DefaultsKeys.obsOutputEnabled) }
     }
 
     private func forceStopPTPCameraDaemons() {
@@ -1485,14 +1507,22 @@ class CameraCapture {
         }
 
         // Ensure Syphon server exists (it should be created in init, but be defensive).
-        if syphonServer == nil, let device = self.device {
-            syphonServer = SyphonMetalServer(name: "GPhoto2 Camera", device: device)
-            syphonHasClientsLast = syphonServer?.hasClients ?? false
+        if syphonOutputEnabled {
+            if syphonServer == nil, let device = self.device {
+                syphonServer = SyphonMetalServer(name: "GPhoto2 Camera", device: device)
+                syphonHasClientsLast = syphonServer?.hasClients ?? false
+            }
+
+            if syphonServer == nil {
+                onStatusUpdate?("Syphon server could not be created")
+                return false
+            }
         }
 
-        if syphonServer == nil {
-            onStatusUpdate?("Syphon server could not be created")
-            return false
+        if obsOutputEnabled {
+            if case .failure(let message) = obsOutput.start() {
+                onStatusUpdate?("OBS Virtual Camera unavailable: \(message)")
+            }
         }
 
         // Don't preemptively kill camera daemons - let retry logic handle USB_CLAIM errors
@@ -1597,6 +1627,7 @@ class CameraCapture {
     func stop() {
         running = false
         captureThread?.cancel()
+        obsOutput.stop()
 
         gphotoLock.lock()
         defer { gphotoLock.unlock() }
@@ -1614,7 +1645,29 @@ class CameraCapture {
         
         onStatusUpdate?("Stopped")
     }
-    
+
+    /// Toggles OBS Virtual Camera output, starting/stopping it immediately if
+    /// capture is currently running (rather than waiting for the next start()).
+    func setOBSOutputEnabled(_ enabled: Bool) {
+        obsOutputEnabled = enabled
+        guard running else { return }
+
+        if enabled {
+            if case .failure(let message) = obsOutput.start() {
+                onStatusUpdate?("OBS Virtual Camera unavailable: \(message)")
+            }
+        } else {
+            obsOutput.stop()
+        }
+    }
+
+    /// Single shared point for future per-frame filters (crop/scale/saturation
+    /// etc.) so every output consumes the same filtered result rather than
+    /// each output implementing its own filter chain.
+    private func applyOutputFilters(_ image: CIImage) -> CIImage {
+        return image
+    }
+
     private func captureLoop() {
         logVerbose("captureLoop starting")
         var texture: MTLTexture?
@@ -1681,47 +1734,57 @@ class CameraCapture {
                 guard let jpegData else { return }
 
                 // Decode JPEG to CIImage
-                guard let ciImage = CIImage(data: jpegData) else { return }
-                
+                guard let decodedImage = CIImage(data: jpegData) else { return }
+                let ciImage = applyOutputFilters(decodedImage)
+
                 let width = Int(ciImage.extent.width)
                 let height = Int(ciImage.extent.height)
-                
-                // Create or recreate texture if needed
-                if texture == nil || texture!.width != width || texture!.height != height {
-                    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-                        pixelFormat: .rgba8Unorm,
-                        width: width,
-                        height: height,
-                        mipmapped: false
-                    )
-                    descriptor.usage = [.shaderRead, .shaderWrite, .renderTarget]
-                    texture = device?.makeTexture(descriptor: descriptor)
-                }
-                
-                guard let tex = texture else { return }
 
-                guard let commandQueue = commandQueue, let commandBuffer = commandQueue.makeCommandBuffer() else {
-                    return
-                }
-                
-                // Render to texture
-                ciContext?.render(
-                    ciImage,
-                    to: tex,
-                    commandBuffer: commandBuffer,
-                    bounds: ciImage.extent,
-                    colorSpace: CGColorSpaceCreateDeviceRGB()
-                )
-                
-                // Publish to Syphon
-                syphonServer?.publishFrameTexture(
-                    tex,
-                    on: commandBuffer,
-                    imageRegion: NSRect(x: 0, y: 0, width: width, height: height),
-                    flipped: false
-                )
+                let syphonActive = syphonOutputEnabled
+                let obsActive = obsOutputEnabled && obsOutput.isStarted
 
-                commandBuffer.commit()
+                if syphonActive {
+                    // Create or recreate texture if needed
+                    if texture == nil || texture!.width != width || texture!.height != height {
+                        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+                            pixelFormat: .rgba8Unorm,
+                            width: width,
+                            height: height,
+                            mipmapped: false
+                        )
+                        descriptor.usage = [.shaderRead, .shaderWrite, .renderTarget]
+                        texture = device?.makeTexture(descriptor: descriptor)
+                    }
+
+                    if let tex = texture, let commandQueue = commandQueue,
+                        let commandBuffer = commandQueue.makeCommandBuffer()
+                    {
+                        // Render to texture
+                        ciContext?.render(
+                            ciImage,
+                            to: tex,
+                            commandBuffer: commandBuffer,
+                            bounds: ciImage.extent,
+                            colorSpace: CGColorSpaceCreateDeviceRGB()
+                        )
+
+                        // Publish to Syphon
+                        syphonServer?.publishFrameTexture(
+                            tex,
+                            on: commandBuffer,
+                            imageRegion: NSRect(x: 0, y: 0, width: width, height: height),
+                            flipped: false
+                        )
+
+                        commandBuffer.commit()
+                    }
+                }
+
+                if obsActive, let ciContext {
+                    // Publish to OBS Virtual Camera (shares the same filtered image;
+                    // it fits/letterboxes into the extension's fixed canvas itself).
+                    obsOutput.publish(ciImage, ciContext: ciContext)
+                }
                 
                 frameCount += 1
                 if frameCount % 30 == 0 {
