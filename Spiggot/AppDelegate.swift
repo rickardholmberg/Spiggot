@@ -21,6 +21,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var autofocusHoldMenuItem: NSMenuItem!
     private var autofocusHoldPresetItems: [NSMenuItem] = []
     private var startAtLoginMenuItem: NSMenuItem!
+    private var syphonOutputMenuItem: NSMenuItem!
+    private var obsOutputMenuItem: NSMenuItem!
     private var autoStartOnSyphonClientMenuItem: NSMenuItem!
     private var autoStopWhenNoSyphonClientsMenuItem: NSMenuItem!
     private var pendingAutoStopWorkItem: DispatchWorkItem?
@@ -79,6 +81,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startStopMenuItem = NSMenuItem(title: "Start Capture", action: #selector(toggleCapture), keyEquivalent: "s")
         menu.addItem(startStopMenuItem)
 
+        menu.addItem(NSMenuItem.separator())
+
+        syphonOutputMenuItem = NSMenuItem(
+            title: "Output: Syphon",
+            action: #selector(toggleSyphonOutput),
+            keyEquivalent: ""
+        )
+        syphonOutputMenuItem.target = self
+        menu.addItem(syphonOutputMenuItem)
+
+        obsOutputMenuItem = NSMenuItem(
+            title: "Output: OBS Virtual Camera",
+            action: #selector(toggleOBSOutput),
+            keyEquivalent: ""
+        )
+        obsOutputMenuItem.target = self
+        menu.addItem(obsOutputMenuItem)
+
+        menu.addItem(NSMenuItem.separator())
+
         startAtLoginMenuItem = NSMenuItem(
             title: "Start at Login",
             action: #selector(toggleStartAtLogin),
@@ -134,7 +156,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if cameraCapture == nil {
             statusMenuItem.title = "Status: Metal init failed"
         }
-        
+
+        syphonOutputMenuItem.state = (cameraCapture?.syphonOutputEnabled ?? true) ? .on : .off
+        obsOutputMenuItem.state = (cameraCapture?.obsOutputEnabled ?? false) ? .on : .off
+
         cameraCapture?.onStatusUpdate = { [weak self] status in
             DispatchQueue.main.async {
                 self?.statusMenuItem.title = "Status: \(status)"
@@ -586,6 +611,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             scheduleAutoStopIfNeeded()
         }
+    }
+
+    @objc private func toggleSyphonOutput() {
+        guard let cameraCapture else { return }
+        let newValue = !cameraCapture.syphonOutputEnabled
+        cameraCapture.syphonOutputEnabled = newValue
+        syphonOutputMenuItem.state = newValue ? .on : .off
+    }
+
+    @objc private func toggleOBSOutput() {
+        guard let cameraCapture else { return }
+        let newValue = !cameraCapture.obsOutputEnabled
+        cameraCapture.setOBSOutputEnabled(newValue)
+        obsOutputMenuItem.state = newValue ? .on : .off
     }
 
     @objc private func toggleAutoStartOnSyphonClient() {
