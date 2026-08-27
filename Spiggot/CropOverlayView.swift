@@ -101,12 +101,34 @@ final class CropOverlayView: NSView {
         return r
     }
 
+    /// The sub-rect of `bounds` the source image actually occupies. The
+    /// preview `NSImageView` aspect-fits the image (matching `.scaleProportionallyUpOrDown`),
+    /// so whenever the source's aspect ratio differs from this view's own
+    /// (very common -- e.g. a 3:2 camera in a 16:9 preview box), the visible
+    /// picture is letterboxed/pillarboxed *inside* `bounds`. Every coordinate
+    /// conversion below must go through this, not raw `bounds`, or the crop
+    /// box drifts away from where the actual photo is being displayed.
+    private func imageDisplayRect() -> CGRect {
+        guard bounds.width > 0, bounds.height > 0, sourceAspectRatio > 0 else { return bounds }
+        let boundsAspect = bounds.width / bounds.height
+        if sourceAspectRatio > boundsAspect {
+            // Image is relatively wider than the box: fits full width, letterboxed top/bottom.
+            let height = bounds.width / sourceAspectRatio
+            return CGRect(x: 0, y: (bounds.height - height) / 2, width: bounds.width, height: height)
+        } else {
+            // Image is relatively taller/narrower: fits full height, pillarboxed left/right.
+            let width = bounds.height * sourceAspectRatio
+            return CGRect(x: (bounds.width - width) / 2, y: 0, width: width, height: bounds.height)
+        }
+    }
+
     private func rectInView() -> CGRect {
-        CGRect(
-            x: normalizedRect.minX * bounds.width,
-            y: normalizedRect.minY * bounds.height,
-            width: normalizedRect.width * bounds.width,
-            height: normalizedRect.height * bounds.height
+        let imageRect = imageDisplayRect()
+        return CGRect(
+            x: imageRect.minX + normalizedRect.minX * imageRect.width,
+            y: imageRect.minY + normalizedRect.minY * imageRect.height,
+            width: normalizedRect.width * imageRect.width,
+            height: normalizedRect.height * imageRect.height
         )
     }
 
@@ -187,12 +209,13 @@ final class CropOverlayView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard bounds.width > 0, bounds.height > 0 else { return }
+        let imageRect = imageDisplayRect()
+        guard imageRect.width > 0, imageRect.height > 0 else { return }
         let point = convert(event.locationInWindow, from: nil)
         let dxView = point.x - dragStartPoint.x
         let dyView = point.y - dragStartPoint.y
-        let dx = dxView / bounds.width
-        let dy = dyView / bounds.height
+        let dx = dxView / imageRect.width
+        let dy = dyView / imageRect.height
 
         var newRect = dragStartRect
 
