@@ -65,10 +65,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     override func showWindow(_ sender: Any?) {
         super.showWindow(sender)
 
-        // Re-derive the aspect lock each time Settings is opened, in case
-        // OBS output was toggled while it was closed. Snaps rather than
-        // resets, so an existing crop isn't discarded.
-        cropOverlayView.setDesiredPixelAspectRatio(cameraCapture?.requiredCropAspectRatio)
+        // Refresh from whatever's actually persisted (CameraCapture's own
+        // applyCrop(_:) self-corrects independently while Settings is
+        // closed, so this may have changed since the window was built).
+        cropOverlayView.normalizedRect = cameraCapture?.cropRect ?? CameraCapture.fullFrameCropRect
+
+        // Update the aspect lock for future drags *without* immediately
+        // re-snapping/persisting: sourceAspectRatio is still just a 1:1
+        // guess until a real preview frame arrives (setSourceAspectRatio
+        // will re-snap correctly once one does), and snapping against a
+        // wrong guess right now would silently corrupt a perfectly good
+        // persisted crop if the camera isn't actively streaming yet.
+        cropOverlayView.setAspectRatioWithoutSnapping(cameraCapture?.requiredCropAspectRatio)
 
         cameraCapture?.onPreviewFrame = { [weak self] cgImage in
             guard let self else { return }
@@ -86,6 +94,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     @objc private func resetCropPressed() {
         cameraCapture?.cropRect = CameraCapture.fullFrameCropRect
         cropOverlayView.normalizedRect = CameraCapture.fullFrameCropRect
+        // If OBS output needs a fixed aspect, snap straight to the centered
+        // box that exactly fills it (matches what applyCrop(_:) will also
+        // self-correct to on the next frame) rather than leaving the
+        // letterboxed full-frame default visible even momentarily.
+        cropOverlayView.setDesiredPixelAspectRatio(cameraCapture?.requiredCropAspectRatio)
     }
 
     @objc private func resetColorPressed() {

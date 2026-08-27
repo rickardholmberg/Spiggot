@@ -1739,10 +1739,35 @@ class CameraCapture {
     /// output consumes the same filtered+cropped result rather than each
     /// output implementing its own filter chain.
     private func applyCrop(_ image: CIImage) -> CIImage {
-        let rect = cropRect
-        guard rect != Self.fullFrameCropRect else { return image }
-
         let extent = image.extent
+        var rect = cropRect
+
+        if let targetPixelRatio = requiredCropAspectRatio, extent.width > 0, extent.height > 0 {
+            let sourcePixelRatio = extent.width / extent.height
+            let targetNormalizedRatio = targetPixelRatio / sourcePixelRatio
+            let currentNormalizedRatio = rect.width / rect.height
+            if abs(currentNormalizedRatio - targetNormalizedRatio) > 0.01 {
+                // The persisted crop doesn't match the aspect OBS output
+                // needs against *this* source's actual pixel dimensions --
+                // either it's still the untouched full-frame default, or it
+                // was set while a different (or no) aspect lock was active.
+                // Self-correct to a centered box that exactly matches, so
+                // OBS never shows letterboxing even if Settings is never
+                // opened. A box the user already dragged while this same
+                // lock was active already matches, so this never overwrites
+                // deliberate framing -- it only runs until it converges.
+                var width: CGFloat = 1.0
+                var height = width / targetNormalizedRatio
+                if height > 1.0 {
+                    height = 1.0
+                    width = height * targetNormalizedRatio
+                }
+                rect = CGRect(x: (1 - width) / 2, y: (1 - height) / 2, width: width, height: height)
+                cropRect = rect
+            }
+        }
+
+        guard rect != Self.fullFrameCropRect else { return image }
         let cropRectInImage = CGRect(
             x: extent.minX + rect.minX * extent.width,
             y: extent.minY + rect.minY * extent.height,

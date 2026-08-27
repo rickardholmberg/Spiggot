@@ -53,7 +53,10 @@ final class CropOverlayView: NSView {
 
     /// Sets a new target *pixel* aspect ratio (e.g. 16.0/9.0), snapping the
     /// current rect to match (keeping it centered) rather than resetting to
-    /// full-frame. Pass nil for free-form.
+    /// full-frame, and persisting that snap via onRectChanged. Pass nil for
+    /// free-form. Only call this when sourceAspectRatio is already known to
+    /// be correct (i.e. a real preview frame has already arrived) -- see
+    /// setAspectRatioWithoutSnapping(_:) otherwise.
     func setDesiredPixelAspectRatio(_ ratio: CGFloat?) {
         desiredPixelAspectRatio = ratio
         guard let effectiveAspectRatio else {
@@ -63,6 +66,20 @@ final class CropOverlayView: NSView {
         normalizedRect = Self.snapped(normalizedRect, toAspectRatio: effectiveAspectRatio)
         needsDisplay = true
         onRectChanged?(normalizedRect)
+    }
+
+    /// Updates which pixel aspect ratio to enforce on *future* drags,
+    /// without immediately re-snapping/persisting the current box. Use this
+    /// when the source's actual aspect ratio isn't known yet (e.g. right
+    /// when Settings opens, before any preview frame has arrived) --
+    /// snapping against the default 1:1 guess would corrupt a perfectly
+    /// good persisted crop the moment the window opens if the camera isn't
+    /// actively streaming. setSourceAspectRatio(_:) re-snaps correctly once
+    /// real frame data arrives; CameraCapture.applyCrop(_:) also
+    /// self-corrects independently of the UI ever being opened at all.
+    func setAspectRatioWithoutSnapping(_ ratio: CGFloat?) {
+        desiredPixelAspectRatio = ratio
+        needsDisplay = true
     }
 
     /// Updates the source frame's pixel aspect ratio (call this whenever a
