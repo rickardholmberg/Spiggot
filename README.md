@@ -47,10 +47,9 @@ If you get header errors, verify the paths in Build Settings:
 ### 4. Run
 
 1. Connect your camera via USB
-2. Set camera to Manual (M) mode for best results
-3. Launch Spiggot
-4. Click the camera icon in the menu bar
-5. Select "Start Capture"
+2. Launch Spiggot
+3. Click the camera icon in the menu bar
+4. Select "Start Capture"
 
 The app will appear as "GPhoto2 Camera" in any Syphon client, and/or as "OBS Virtual Camera" system-wide if that output is enabled (see below).
 
