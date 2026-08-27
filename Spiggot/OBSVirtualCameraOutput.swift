@@ -29,6 +29,7 @@ final class OBSVirtualCameraOutput {
     private static let canvasWidth = 1920
     private static let canvasHeight = 1080
     private static let maxPublishHz: Double = 30.0
+    private static let deviceRGB = CGColorSpaceCreateDeviceRGB()
 
     private var deviceID: CMIODeviceID?
     private var sinkStreamID: CMIOStreamID?
@@ -137,15 +138,25 @@ final class OBSVirtualCameraOutput {
         // doesn't cover the whole canvas (any aspect ratio other than
         // exactly 16:9), the uncovered letterbox/pillarbox area must be
         // explicitly painted black, or it shows whatever garbage was left
-        // over from a previous frame's contents in that buffer.
-        let background = CIImage(color: .black).cropped(to: canvasRect)
-        let composited = fitted.composited(over: background)
+        // over from a previous frame's contents in that buffer. Skip the
+        // extra composite/blend pass entirely in the common case where the
+        // crop is already locked to 16:9 and `fitted` fills the canvas
+        // exactly -- there's nothing to paint around.
+        let fillsCanvas = abs(scaledWidth - CGFloat(Self.canvasWidth)) < 1
+            && abs(scaledHeight - CGFloat(Self.canvasHeight)) < 1
+        let toRender: CIImage
+        if fillsCanvas {
+            toRender = fitted
+        } else {
+            let background = CIImage(color: .black).cropped(to: canvasRect)
+            toRender = fitted.composited(over: background)
+        }
 
         ciContext.render(
-            composited,
+            toRender,
             to: pixelBuffer,
             bounds: canvasRect,
-            colorSpace: CGColorSpaceCreateDeviceRGB()
+            colorSpace: Self.deviceRGB
         )
 
         var sampleBuffer: CMSampleBuffer?
