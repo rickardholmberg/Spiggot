@@ -1,6 +1,6 @@
 # Spiggot
 
-A macOS menu bar app that captures video from gphoto2-compatible cameras and outputs to Syphon for use in OBS, video software, or any Syphon client.
+A macOS menu bar app that captures video from gphoto2-compatible cameras and outputs it to Syphon and/or directly to OBS Studio's virtual camera, for use in video software, video calls, or any Syphon/system-camera client.
 
 ## Requirements
 
@@ -52,13 +52,28 @@ If you get header errors, verify the paths in Build Settings:
 4. Click the camera icon in the menu bar
 5. Select "Start Capture"
 
-The app will appear as "GPhoto2 Camera" in any Syphon client.
+The app will appear as "GPhoto2 Camera" in any Syphon client, and/or as "OBS Virtual Camera" system-wide if that output is enabled (see below).
 
-## Using with OBS
+## Outputs
+
+Spiggot can publish frames to either or both of:
+
+- **Syphon** ("GPhoto2 Camera") — for OBS (via a Syphon plugin), video-editing software, or any other Syphon client.
+- **OBS Studio's virtual camera** — Spiggot pushes frames directly into OBS's own "OBS Camera Extension" device. This does **not** require OBS Studio to be running (or even open) — just installed and run once so its camera extension is activated on your Mac. Once activated, "OBS Virtual Camera" shows up as a regular system camera in *any* app (Zoom, Microsoft Teams, Photo Booth, QuickTime, etc.), not just inside OBS itself.
+
+Toggle each independently from the menu bar: **Output: Syphon** / **Output: OBS Virtual Camera**. Syphon is on by default; OBS output is off by default since it requires OBS Studio to have been installed and run at least once.
+
+Note: OBS's virtual camera device has a fixed 1920x1080 (16:9) canvas — Spiggot automatically crops to fill it with no letterboxing whenever this output is enabled (see Crop below). Syphon has no such restriction and always publishes at the camera's native preview resolution/aspect ratio.
+
+## Using with OBS Studio directly (via Syphon)
 
 1. Install the OBS Syphon plugin: https://github.com/zakk4223/obs-syphon
 2. Add a new "Syphon Client" source
 3. Select "Spiggot - GPhoto2 Camera"
+
+## Crop, scale, and color
+
+Open **Settings…** from the menu bar for a live-preview crop box (drag to move/resize, locked to 16:9 when OBS output is enabled so there's never any letterboxing) plus Hue/Saturation/Lightness sliders. All changes apply live and persist across launches; "Reset Crop" and "Reset Color" restore the defaults.
 
 ## Troubleshooting
 
