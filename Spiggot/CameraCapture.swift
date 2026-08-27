@@ -164,6 +164,9 @@ class CameraCapture {
         static let syphonOutputEnabled = "SyphonOutputEnabled"
         static let obsOutputEnabled = "OBSOutputEnabled"
         static let cropRect = "CropRectNormalized"
+        static let hueAdjustDegrees = "HueAdjustDegrees"
+        static let saturationAdjust = "SaturationAdjust"
+        static let lightnessAdjust = "LightnessAdjust"
     }
 
     private enum AutofocusTiming {
@@ -190,6 +193,7 @@ class CameraCapture {
     private var device: MTLDevice?
     private var commandQueue: MTLCommandQueue?
     private var ciContext: CIContext?
+    private static let deviceRGB = CGColorSpaceCreateDeviceRGB()
     private var running = false
     private var captureThread: Thread?
 
@@ -278,6 +282,28 @@ class CameraCapture {
             let stored = "\(clamped.minX),\(clamped.minY),\(clamped.width),\(clamped.height)"
             UserDefaults.standard.set(stored, forKey: DefaultsKeys.cropRect)
         }
+    }
+
+    /// Hue rotation in degrees (-180...180). 0 = no change.
+    var hueAdjustDegrees: Double {
+        get { UserDefaults.standard.double(forKey: DefaultsKeys.hueAdjustDegrees) }
+        set { UserDefaults.standard.set(newValue, forKey: DefaultsKeys.hueAdjustDegrees) }
+    }
+
+    /// Saturation multiplier (0 = grayscale, 1 = normal, 2 = max). Defaults
+    /// to 1 (no change) when unset.
+    var saturationAdjust: Double {
+        get {
+            guard UserDefaults.standard.object(forKey: DefaultsKeys.saturationAdjust) != nil else { return 1.0 }
+            return UserDefaults.standard.double(forKey: DefaultsKeys.saturationAdjust)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: DefaultsKeys.saturationAdjust) }
+    }
+
+    /// Lightness/brightness offset (-1...1). 0 = no change.
+    var lightnessAdjust: Double {
+        get { UserDefaults.standard.double(forKey: DefaultsKeys.lightnessAdjust) }
+        set { UserDefaults.standard.set(newValue, forKey: DefaultsKeys.lightnessAdjust) }
     }
 
     /// The aspect ratio the crop box must be locked to so the result exactly
@@ -1687,10 +1713,32 @@ class CameraCapture {
         }
     }
 
-    /// Single shared point for future per-frame filters (crop/scale/saturation
-    /// etc.) so every output consumes the same filtered result rather than
-    /// each output implementing its own filter chain.
-    private func applyOutputFilters(_ image: CIImage) -> CIImage {
+    /// Shared color-adjustment point (hue/saturation/lightness) applied to
+    /// the full, uncropped frame -- before applyCrop(_:) -- so the live
+    /// preview (which shows color-adjusted but uncropped frames, so users
+    /// can still choose a crop region) and both outputs see identical
+    /// color grading. Cheap no-op when all three are at their defaults.
+    private func applyColorFilters(_ image: CIImage) -> CIImage {
+        var result = image
+        if hueAdjustDegrees != 0 {
+            result = result.applyingFilter("CIHueAdjust", parameters: [
+                "inputAngle": hueAdjustDegrees * .pi / 180
+            ])
+        }
+        if saturationAdjust != 1.0 || lightnessAdjust != 0.0 {
+            result = result.applyingFilter("CIColorControls", parameters: [
+                "inputSaturation": saturationAdjust,
+                "inputBrightness": lightnessAdjust,
+                "inputContrast": 1.0,
+            ])
+        }
+        return result
+    }
+
+    /// Shared crop point, applied after applyColorFilters(_:) so every
+    /// output consumes the same filtered+cropped result rather than each
+    /// output implementing its own filter chain.
+    private func applyCrop(_ image: CIImage) -> CIImage {
         let rect = cropRect
         guard rect != Self.fullFrameCropRect else { return image }
 
@@ -1734,7 +1782,17 @@ class CameraCapture {
 
         var lastPreviewErrorLog: Date = .distantPast
         var consecutivePreviewErrors = 0
-        
+
+        // Some cameras deliver live-view frames faster than either output
+        // actually needs (OBS is capped at 30fps internally; Syphon clients
+        // rarely benefit from more). Decoding + Core Image processing +
+        // rendering is real CPU/GPU work, so skip it on frames beyond this
+        // rate rather than doing it for frames nobody will see -- still call
+        // gp_camera_capture_preview every loop iteration regardless, since
+        // that's what drains the camera's own live-view buffer.
+        let maxProcessingHz: Double = 30.0
+        var lastProcessedTime: CFAbsoluteTime = 0
+
         while running && !Thread.current.isCancelled {
             autoreleasepool {
                 // Keep gphoto2 lock scope as small as possible so UI-triggered camera commands
@@ -1792,10 +1850,15 @@ class CameraCapture {
 
                 guard let jpegData else { return }
 
+                let now = CFAbsoluteTimeGetCurrent()
+                guard now - lastProcessedTime >= 1.0 / maxProcessingHz else { return }
+                lastProcessedTime = now
+
                 // Decode JPEG to CIImage
                 guard let decodedImage = CIImage(data: jpegData) else { return }
-                publishPreviewFrame(decodedImage)
-                let ciImage = applyOutputFilters(decodedImage)
+                let colorAdjusted = applyColorFilters(decodedImage)
+                publishPreviewFrame(colorAdjusted)
+                let ciImage = applyCrop(colorAdjusted)
 
                 let width = Int(ciImage.extent.width)
                 let height = Int(ciImage.extent.height)
@@ -1825,7 +1888,7 @@ class CameraCapture {
                             to: tex,
                             commandBuffer: commandBuffer,
                             bounds: ciImage.extent,
-                            colorSpace: CGColorSpaceCreateDeviceRGB()
+                            colorSpace: Self.deviceRGB
                         )
 
                         // Publish to Syphon
