@@ -7,6 +7,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let cropImageView = NSImageView(frame: .zero)
     private let cropOverlayView = CropOverlayView(frame: .zero)
     private let resetCropButton = NSButton(title: "Reset Crop", target: nil, action: nil)
+    private let resetColorButton = NSButton(title: "Reset Color", target: nil, action: nil)
+
+    private let hueLabel = NSTextField(labelWithString: "Hue:")
+    private let hueSlider = NSSlider(value: 0, minValue: -180, maxValue: 180, target: nil, action: nil)
+    private let hueValueLabel = NSTextField(labelWithString: "0°")
+
+    private let saturationLabel = NSTextField(labelWithString: "Saturation:")
+    private let saturationSlider = NSSlider(value: 1, minValue: 0, maxValue: 2, target: nil, action: nil)
+    private let saturationValueLabel = NSTextField(labelWithString: "100%")
+
+    private let lightnessLabel = NSTextField(labelWithString: "Lightness:")
+    private let lightnessSlider = NSSlider(value: 0, minValue: -1, maxValue: 1, target: nil, action: nil)
+    private let lightnessValueLabel = NSTextField(labelWithString: "0%")
 
     private let cameraPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let refreshButton = NSButton(title: "Refresh", target: nil, action: nil)
@@ -29,7 +42,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         self.cameraCapture = cameraCapture
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 620, height: 860),
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 980),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -75,6 +88,34 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         cropOverlayView.normalizedRect = CameraCapture.fullFrameCropRect
     }
 
+    @objc private func resetColorPressed() {
+        cameraCapture?.hueAdjustDegrees = 0
+        cameraCapture?.saturationAdjust = 1.0
+        cameraCapture?.lightnessAdjust = 0
+        hueSlider.doubleValue = 0
+        saturationSlider.doubleValue = 1.0
+        lightnessSlider.doubleValue = 0
+        hueValueLabel.stringValue = "0°"
+        saturationValueLabel.stringValue = "100%"
+        lightnessValueLabel.stringValue = "0%"
+    }
+
+    @objc private func colorSliderChanged(_ sender: NSSlider) {
+        switch sender {
+        case hueSlider:
+            cameraCapture?.hueAdjustDegrees = hueSlider.doubleValue
+            hueValueLabel.stringValue = "\(Int(hueSlider.doubleValue))°"
+        case saturationSlider:
+            cameraCapture?.saturationAdjust = saturationSlider.doubleValue
+            saturationValueLabel.stringValue = "\(Int(saturationSlider.doubleValue * 100))%"
+        case lightnessSlider:
+            cameraCapture?.lightnessAdjust = lightnessSlider.doubleValue
+            lightnessValueLabel.stringValue = "\(Int(lightnessSlider.doubleValue * 100))%"
+        default:
+            break
+        }
+    }
+
     private func buildUI() {
         guard let contentView = window?.contentView else { return }
 
@@ -106,6 +147,39 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         resetCropButton.target = self
         resetCropButton.action = #selector(resetCropPressed)
         resetCropButton.bezelStyle = .rounded
+
+        resetColorButton.translatesAutoresizingMaskIntoConstraints = false
+        resetColorButton.target = self
+        resetColorButton.action = #selector(resetColorPressed)
+        resetColorButton.bezelStyle = .rounded
+
+        for label in [hueLabel, saturationLabel, lightnessLabel, hueValueLabel, saturationValueLabel, lightnessValueLabel] {
+            label.translatesAutoresizingMaskIntoConstraints = false
+        }
+        hueValueLabel.alignment = .right
+        saturationValueLabel.alignment = .right
+        lightnessValueLabel.alignment = .right
+        hueValueLabel.textColor = .secondaryLabelColor
+        saturationValueLabel.textColor = .secondaryLabelColor
+        lightnessValueLabel.textColor = .secondaryLabelColor
+
+        hueSlider.translatesAutoresizingMaskIntoConstraints = false
+        hueSlider.target = self
+        hueSlider.action = #selector(colorSliderChanged)
+        hueSlider.doubleValue = cameraCapture?.hueAdjustDegrees ?? 0
+        hueValueLabel.stringValue = "\(Int(hueSlider.doubleValue))°"
+
+        saturationSlider.translatesAutoresizingMaskIntoConstraints = false
+        saturationSlider.target = self
+        saturationSlider.action = #selector(colorSliderChanged)
+        saturationSlider.doubleValue = cameraCapture?.saturationAdjust ?? 1.0
+        saturationValueLabel.stringValue = "\(Int(saturationSlider.doubleValue * 100))%"
+
+        lightnessSlider.translatesAutoresizingMaskIntoConstraints = false
+        lightnessSlider.target = self
+        lightnessSlider.action = #selector(colorSliderChanged)
+        lightnessSlider.doubleValue = cameraCapture?.lightnessAdjust ?? 0
+        lightnessValueLabel.stringValue = "\(Int(lightnessSlider.doubleValue * 100))%"
 
         cropSeparator.translatesAutoresizingMaskIntoConstraints = false
 
@@ -166,6 +240,16 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         contentView.addSubview(cropImageView)
         cropImageView.addSubview(cropOverlayView)
         contentView.addSubview(resetCropButton)
+        contentView.addSubview(resetColorButton)
+        contentView.addSubview(hueLabel)
+        contentView.addSubview(hueSlider)
+        contentView.addSubview(hueValueLabel)
+        contentView.addSubview(saturationLabel)
+        contentView.addSubview(saturationSlider)
+        contentView.addSubview(saturationValueLabel)
+        contentView.addSubview(lightnessLabel)
+        contentView.addSubview(lightnessSlider)
+        contentView.addSubview(lightnessValueLabel)
         contentView.addSubview(cropSeparator)
 
         contentView.addSubview(cameraLabel)
@@ -197,9 +281,42 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             resetCropButton.leadingAnchor.constraint(equalTo: cropImageView.trailingAnchor, constant: 16),
             resetCropButton.topAnchor.constraint(equalTo: cropImageView.topAnchor),
 
+            resetColorButton.leadingAnchor.constraint(equalTo: resetCropButton.leadingAnchor),
+            resetColorButton.topAnchor.constraint(equalTo: resetCropButton.bottomAnchor, constant: 8),
+
+            hueLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            hueLabel.widthAnchor.constraint(equalToConstant: 80),
+            hueLabel.topAnchor.constraint(equalTo: cropImageView.bottomAnchor, constant: 16),
+            hueSlider.leadingAnchor.constraint(equalTo: hueLabel.trailingAnchor, constant: 8),
+            hueSlider.trailingAnchor.constraint(equalTo: hueValueLabel.leadingAnchor, constant: -8),
+            hueSlider.centerYAnchor.constraint(equalTo: hueLabel.centerYAnchor),
+            hueValueLabel.widthAnchor.constraint(equalToConstant: 50),
+            hueValueLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+            hueValueLabel.centerYAnchor.constraint(equalTo: hueLabel.centerYAnchor),
+
+            saturationLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            saturationLabel.widthAnchor.constraint(equalToConstant: 80),
+            saturationLabel.topAnchor.constraint(equalTo: hueLabel.bottomAnchor, constant: 12),
+            saturationSlider.leadingAnchor.constraint(equalTo: saturationLabel.trailingAnchor, constant: 8),
+            saturationSlider.trailingAnchor.constraint(equalTo: saturationValueLabel.leadingAnchor, constant: -8),
+            saturationSlider.centerYAnchor.constraint(equalTo: saturationLabel.centerYAnchor),
+            saturationValueLabel.widthAnchor.constraint(equalToConstant: 50),
+            saturationValueLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+            saturationValueLabel.centerYAnchor.constraint(equalTo: saturationLabel.centerYAnchor),
+
+            lightnessLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            lightnessLabel.widthAnchor.constraint(equalToConstant: 80),
+            lightnessLabel.topAnchor.constraint(equalTo: saturationLabel.bottomAnchor, constant: 12),
+            lightnessSlider.leadingAnchor.constraint(equalTo: lightnessLabel.trailingAnchor, constant: 8),
+            lightnessSlider.trailingAnchor.constraint(equalTo: lightnessValueLabel.leadingAnchor, constant: -8),
+            lightnessSlider.centerYAnchor.constraint(equalTo: lightnessLabel.centerYAnchor),
+            lightnessValueLabel.widthAnchor.constraint(equalToConstant: 50),
+            lightnessValueLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+            lightnessValueLabel.centerYAnchor.constraint(equalTo: lightnessLabel.centerYAnchor),
+
             cropSeparator.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
             cropSeparator.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
-            cropSeparator.topAnchor.constraint(equalTo: cropImageView.bottomAnchor, constant: 16),
+            cropSeparator.topAnchor.constraint(equalTo: lightnessLabel.bottomAnchor, constant: 16),
 
             cameraLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
             cameraLabel.topAnchor.constraint(equalTo: cropSeparator.bottomAnchor, constant: 16),
