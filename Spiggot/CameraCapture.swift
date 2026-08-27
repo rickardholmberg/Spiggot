@@ -163,6 +163,7 @@ class CameraCapture {
         static let autofocusHoldSeconds = "AutofocusHoldSeconds"
         static let syphonOutputEnabled = "SyphonOutputEnabled"
         static let obsOutputEnabled = "OBSOutputEnabled"
+        static let cropRect = "CropRectNormalized"
     }
 
     private enum AutofocusTiming {
@@ -257,6 +258,33 @@ class CameraCapture {
     var obsOutputEnabled: Bool {
         get { UserDefaults.standard.bool(forKey: DefaultsKeys.obsOutputEnabled) }
         set { UserDefaults.standard.set(newValue, forKey: DefaultsKeys.obsOutputEnabled) }
+    }
+
+    static let fullFrameCropRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+
+    /// Crop region in normalized (0...1) coordinates relative to the full
+    /// decoded frame. Defaults to the full frame (no crop).
+    var cropRect: CGRect {
+        get {
+            guard let stored = UserDefaults.standard.string(forKey: DefaultsKeys.cropRect) else {
+                return Self.fullFrameCropRect
+            }
+            let parts = stored.split(separator: ",").compactMap { Double($0) }
+            guard parts.count == 4 else { return Self.fullFrameCropRect }
+            return CGRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3])
+        }
+        set {
+            let clamped = newValue.intersection(Self.fullFrameCropRect)
+            let stored = "\(clamped.minX),\(clamped.minY),\(clamped.width),\(clamped.height)"
+            UserDefaults.standard.set(stored, forKey: DefaultsKeys.cropRect)
+        }
+    }
+
+    /// The aspect ratio the crop box must be locked to so the result exactly
+    /// fills OBS's fixed-canvas virtual camera with no letterboxing. `nil`
+    /// means free-form (OBS output isn't enabled, so nothing needs a fixed shape).
+    var requiredCropAspectRatio: CGFloat? {
+        return obsOutputEnabled ? 16.0 / 9.0 : nil
     }
 
     private func forceStopPTPCameraDaemons() {
@@ -1447,7 +1475,15 @@ class CameraCapture {
     // Status callback
     var onStatusUpdate: ((String) -> Void)?
     var onFrameCount: ((Int) -> Void)?
-    
+
+    /// Live full-frame (pre-crop) preview for the Settings window's crop UI.
+    /// Only generated while this is non-nil, and throttled independently of
+    /// the capture rate, so there's no overhead when Settings isn't open.
+    var onPreviewFrame: ((CGImage) -> Void)?
+    private var lastPreviewTime: CFAbsoluteTime = 0
+    private let previewIntervalSeconds: CFAbsoluteTime = 1.0 / 10.0
+    private let previewMaxWidth: CGFloat = 480
+
     init?() {
         Self.configureGPhoto2EnvironmentForBundledCamlibs()
 
@@ -1665,7 +1701,40 @@ class CameraCapture {
     /// etc.) so every output consumes the same filtered result rather than
     /// each output implementing its own filter chain.
     private func applyOutputFilters(_ image: CIImage) -> CIImage {
-        return image
+        let rect = cropRect
+        guard rect != Self.fullFrameCropRect else { return image }
+
+        let extent = image.extent
+        let cropRectInImage = CGRect(
+            x: extent.minX + rect.minX * extent.width,
+            y: extent.minY + rect.minY * extent.height,
+            width: rect.width * extent.width,
+            height: rect.height * extent.height
+        )
+        let cropped = image.cropped(to: cropRectInImage)
+        // Downstream code (texture creation, letterbox fitting) assumes an
+        // origin-zero extent, so translate the crop back to (0, 0).
+        return cropped.transformed(by: CGAffineTransform(translationX: -cropped.extent.minX, y: -cropped.extent.minY))
+    }
+
+    /// Downscales and dispatches a preview frame for the Settings window's
+    /// live crop UI. No-op (and cheap to check) when nobody is listening.
+    private func publishPreviewFrame(_ image: CIImage) {
+        guard let onPreviewFrame else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastPreviewTime >= previewIntervalSeconds else { return }
+        guard let ciContext else { return }
+
+        let extent = image.extent
+        guard extent.width > 0 else { return }
+        let scale = min(1.0, previewMaxWidth / extent.width)
+        let scaled = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        guard let cgImage = ciContext.createCGImage(scaled, from: scaled.extent) else { return }
+
+        lastPreviewTime = now
+        DispatchQueue.main.async {
+            onPreviewFrame(cgImage)
+        }
     }
 
     private func captureLoop() {
@@ -1735,6 +1804,7 @@ class CameraCapture {
 
                 // Decode JPEG to CIImage
                 guard let decodedImage = CIImage(data: jpegData) else { return }
+                publishPreviewFrame(decodedImage)
                 let ciImage = applyOutputFilters(decodedImage)
 
                 let width = Int(ciImage.extent.width)
