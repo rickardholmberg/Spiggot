@@ -40,6 +40,13 @@ final class OBSVirtualCameraOutput {
 
     var isStarted: Bool { deviceID != nil && sinkStreamID != nil }
 
+    /// Cheap presence check (no stream start) so callers can validate OBS's
+    /// extension is reachable before committing to enabling output -- e.g.
+    /// while capture isn't running yet, when `start()` won't be called.
+    static func isExtensionAvailable() -> Bool {
+        findDeviceAndSinkStream() != nil
+    }
+
     /// Finds the OBS camera device, starts its sink stream, and prepares the
     /// pixel buffer pool. Returns false (non-fatal) if OBS's extension isn't
     /// active on this Mac -- that's a normal "not installed/approved yet" state.

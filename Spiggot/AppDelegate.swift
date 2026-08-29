@@ -163,6 +163,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cameraCapture?.onStatusUpdate = { [weak self] status in
             DispatchQueue.main.async {
                 self?.statusMenuItem.title = "Status: \(status)"
+                if status.hasPrefix("OBS Virtual Camera unavailable") {
+                    self?.obsOutputMenuItem.state = (self?.cameraCapture?.obsOutputEnabled ?? false) ? .on : .off
+                }
             }
         }
         
@@ -623,8 +626,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleOBSOutput() {
         guard let cameraCapture else { return }
         let newValue = !cameraCapture.obsOutputEnabled
-        cameraCapture.setOBSOutputEnabled(newValue)
-        obsOutputMenuItem.state = newValue ? .on : .off
+        let result = cameraCapture.setOBSOutputEnabled(newValue)
+        obsOutputMenuItem.state = cameraCapture.obsOutputEnabled ? .on : .off
+
+        if case .failure(let error) = result {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "OBS Virtual Camera Unavailable"
+            alert.informativeText = error.description
+            alert.runModal()
+        }
     }
 
     @objc private func toggleAutoStartOnSyphonClient() {

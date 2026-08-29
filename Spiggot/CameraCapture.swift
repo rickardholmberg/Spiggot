@@ -1582,6 +1582,7 @@ class CameraCapture {
         if obsOutputEnabled {
             if case .failure(let message) = obsOutput.start() {
                 onStatusUpdate?("OBS Virtual Camera unavailable: \(message)")
+                obsOutputEnabled = false
             }
         }
 
@@ -1708,17 +1709,34 @@ class CameraCapture {
 
     /// Toggles OBS Virtual Camera output, starting/stopping it immediately if
     /// capture is currently running (rather than waiting for the next start()).
-    func setOBSOutputEnabled(_ enabled: Bool) {
-        obsOutputEnabled = enabled
-        guard running else { return }
-
-        if enabled {
-            if case .failure(let message) = obsOutput.start() {
-                onStatusUpdate?("OBS Virtual Camera unavailable: \(message)")
-            }
-        } else {
+    /// Returns the failure (extension not found/reachable) so the caller can
+    /// surface it to the user instead of leaving a checked-but-broken toggle.
+    @discardableResult
+    func setOBSOutputEnabled(_ enabled: Bool) -> Result<Void, OBSVirtualCameraError> {
+        guard enabled else {
+            obsOutputEnabled = false
             obsOutput.stop()
+            return .success(())
         }
+
+        // Capture may not be running yet, in which case obsOutput.start() won't
+        // be attempted until start() (line ~1582) runs later -- probe presence
+        // now so enabling the toggle gives immediate feedback either way.
+        guard OBSVirtualCameraOutput.isExtensionAvailable() else {
+            let error = OBSVirtualCameraError(description: "OBS Camera Extension not found (install/run OBS Studio once to activate it)")
+            onStatusUpdate?("OBS Virtual Camera unavailable: \(error)")
+            return .failure(error)
+        }
+
+        obsOutputEnabled = true
+        guard running else { return .success(()) }
+
+        if case .failure(let error) = obsOutput.start() {
+            onStatusUpdate?("OBS Virtual Camera unavailable: \(error)")
+            obsOutputEnabled = false
+            return .failure(error)
+        }
+        return .success(())
     }
 
     /// Shared color-adjustment point (hue/saturation/lightness) applied to
