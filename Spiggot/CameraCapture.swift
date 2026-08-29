@@ -115,6 +115,14 @@ class CameraCapture {
         if FileManager.default.fileExists(atPath: camlibsURL.path) {
             setenv("CAMLIBS", camlibsURL.path, 1)
         }
+
+        // Without this, libgphoto2_port falls back to its compiled-in default
+        // path (wherever it happened to be built), which rarely exists on the
+        // end user's machine and makes gp_camera_autodetect fail entirely.
+        let iolibsURL = resourcesURL.appendingPathComponent("libgphoto2/iolibs", isDirectory: true)
+        if FileManager.default.fileExists(atPath: iolibsURL.path) {
+            setenv("IOLIBS", iolibsURL.path, 1)
+        }
     }
     enum CameraCaptureError: LocalizedError {
         case message(String)

@@ -283,6 +283,57 @@ else
   done < <(find "$CAMLIBS_DST" -type f \( -name '*.so' -o -name '*.dylib' \) -print 2>/dev/null)
 fi
 
+# --- Copy iolibs (port drivers, e.g. usb1.so) ---
+# Without these, gp_camera_autodetect fails to load a USB port driver at all
+# (GP_ERROR_LIBRARY) unless the runtime machine happens to have the exact
+# libgphoto2_port version/path that was present at build time - defeating the
+# whole point of bundling. Same directory-shape fallback as camlibs above.
+IOLIBS_SRC=""
+IOLIBS_SRC="$(find "$GPHOTO2_PREFIX/lib" -type d -path '*/libgphoto2_port/*' -print -quit 2>/dev/null || true)"
+
+if [[ -z "$IOLIBS_SRC" ]]; then
+  say "WARNING: iolibs not found under $GPHOTO2_PREFIX/lib/libgphoto2_port. Camera autodetect will fail at runtime."
+else
+  IOLIBS_DST="$RES_DIR/libgphoto2/iolibs"
+  mkdir -p "$IOLIBS_DST"
+  say "Copying iolibs from: $IOLIBS_SRC"
+  /usr/bin/ditto "$IOLIBS_SRC" "$IOLIBS_DST"
+
+  while IFS= read -r bundle; do
+    [[ -f "$bundle" ]] || continue
+    copy_transitive_deps "$bundle"
+  done < <(find "$IOLIBS_DST" -type f \( -name '*.so' -o -name '*.dylib' \) -print 2>/dev/null)
+
+  for _ in 1 2 3; do
+    for f in "$FW_DIR"/*.dylib; do
+      [[ -f "$f" ]] || continue
+      copy_transitive_deps "$f"
+    done
+  done
+
+  for f in "$FW_DIR"/*.dylib; do
+    [[ -f "$f" ]] || continue
+    /usr/bin/install_name_tool -id "@rpath/$(basename "$f")" "$f" || true
+  done
+
+  while IFS= read -r bundle; do
+    [[ -f "$bundle" ]] || continue
+    fixup_macho "$bundle"
+  done < <(find "$IOLIBS_DST" -type f \( -name '*.so' -o -name '*.dylib' \) -print 2>/dev/null)
+
+  fixup_macho "$APP_EXE"
+  for f in "$FW_DIR"/*.dylib; do
+    [[ -f "$f" ]] || continue
+    fixup_macho "$f"
+  done
+
+  say "Signing iolibs"
+  while IFS= read -r bundle; do
+    [[ -f "$bundle" ]] || continue
+    /usr/bin/codesign --force --sign "${CODESIGN_IDENTITY:--}" "$bundle" || true
+  done < <(find "$IOLIBS_DST" -type f \( -name '*.so' -o -name '*.dylib' \) -print 2>/dev/null)
+fi
+
 # Sign all bundled dylibs (install_name_tool invalidates their signatures).
 say "Signing bundled dylibs"
 for f in "$FW_DIR"/*.dylib; do
