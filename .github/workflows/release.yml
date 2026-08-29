@@ -46,6 +46,15 @@ jobs:
         run: |
           bash scripts/package_release_zip.sh
 
+      - name: Run post-build QA checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP_PATH="$(ls -1 dist/Spiggot-macOS-*.zip | head -n 1)"
+          QA_DIR="$(mktemp -d)"
+          ditto -x -k "$ZIP_PATH" "$QA_DIR"
+          bash scripts/qa_verify_release.sh "$QA_DIR/Spiggot.app"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
