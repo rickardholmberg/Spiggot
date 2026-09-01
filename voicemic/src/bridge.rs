@@ -9,7 +9,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -20,6 +20,46 @@ use crate::drift::{DriftController, MAX_DEVIATION};
 use crate::enhancer::Enhancer;
 use crate::stats::FrameTimes;
 use crate::{FRAME_DEADLINE_US, HOP_SIZE, SAMPLE_RATE};
+
+/// Raise the calling thread's scheduling priority.
+///
+/// The worker is busy roughly a quarter of each 10 ms frame and sleeps the rest.
+/// Measured, that duty cycle alone inflates per-frame time about 2.2x against a
+/// flat-out loop, because the core clocks down between frames; on Apple Silicon a
+/// default-QoS thread can also be placed on an efficiency core. Asking for
+/// user-interactive tells the scheduler this is latency-sensitive work.
+mod qos {
+    /// From `<pthread/qos.h>`. `QOS_CLASS_USER_INTERACTIVE`.
+    #[cfg(target_os = "macos")]
+    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+
+    #[cfg(target_os = "macos")]
+    extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+
+    /// Best effort: a failure is reported, never fatal. The pipeline runs either
+    /// way, just with a wider tail.
+    pub fn elevate_current_thread() -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            // Safety: the symbol is in libSystem, takes a QoS class and a relative
+            // priority, and affects only the calling thread.
+            let rc = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(format!("pthread_set_qos_class_self_np returned {rc}"))
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Linux would need SCHED_FIFO, which requires privileges we should not
+            // ask for in a measurement tool.
+            Err("no priority mechanism on this platform".to_string())
+        }
+    }
+}
 
 /// Resampler chunk size. One DeepFilterNet frame keeps the pipeline in step.
 const RESAMPLER_CHUNK: usize = HOP_SIZE;
@@ -42,7 +82,6 @@ pub struct BridgeConfig {
 }
 
 /// Lock-free counters shared with the audio callbacks.
-#[derive(Default)]
 pub struct SharedStats {
     pub output_underruns: AtomicU64,
     pub input_overruns: AtomicU64,
@@ -61,9 +100,40 @@ pub struct SharedStats {
     pub out_block_frames: AtomicU64,
     /// Enhancer algorithmic delay, in samples.
     pub model_delay_samples: AtomicU64,
+    /// Ring fill extremes since the last report. A 1 Hz sample of a value written
+    /// ~94 times a second cannot be told apart from aliasing of the drain phase,
+    /// which is why these are tracked rather than the instantaneous value alone.
+    pub fill_min: AtomicU64,
+    pub fill_max: AtomicU64,
+    pub fill_sum: AtomicU64,
+    pub fill_samples: AtomicU64,
+    /// Cumulative time inside the enhancer, for the worker's busy fraction.
+    pub busy_us_total: AtomicU64,
 }
 
 impl SharedStats {
+    /// Record one observation of the output ring's fill. Called from the audio
+    /// callback, so it must stay allocation- and lock-free.
+    pub fn observe_fill(&self, fill: u64) {
+        self.ring_fill.store(fill, Ordering::Relaxed);
+        self.fill_min.fetch_min(fill, Ordering::Relaxed);
+        self.fill_max.fetch_max(fill, Ordering::Relaxed);
+        self.fill_sum.fetch_add(fill, Ordering::Relaxed);
+        self.fill_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read and reset the fill window. Returns `(min, max, mean)`.
+    pub fn take_fill_window(&self) -> Option<(u64, u64, f64)> {
+        let n = self.fill_samples.swap(0, Ordering::Relaxed);
+        let sum = self.fill_sum.swap(0, Ordering::Relaxed);
+        let min = self.fill_min.swap(u64::MAX, Ordering::Relaxed);
+        let max = self.fill_max.swap(0, Ordering::Relaxed);
+        if n == 0 {
+            return None;
+        }
+        Some((min, max, sum as f64 / n as f64))
+    }
+
     pub fn drift_ratio(&self) -> f64 {
         self.drift_ratio_nano.load(Ordering::Relaxed) as f64 / 1e9
     }
@@ -92,6 +162,32 @@ impl SharedStats {
             jitter_ms: ms((jitter_frames * HOP_SIZE) as u64),
             output_buffer_ms: ms(outb),
         })
+    }
+}
+
+impl Default for SharedStats {
+    fn default() -> Self {
+        Self {
+            output_underruns: AtomicU64::new(0),
+            input_overruns: AtomicU64::new(0),
+            deadline_misses: AtomicU64::new(0),
+            frames_done: AtomicU64::new(0),
+            mean_us: AtomicU64::new(0),
+            p50_us: AtomicU64::new(0),
+            p99_us: AtomicU64::new(0),
+            max_us: AtomicU64::new(0),
+            ring_fill: AtomicU64::new(0),
+            drift_ratio_nano: AtomicU64::new(0),
+            in_block_frames: AtomicU64::new(0),
+            out_block_frames: AtomicU64::new(0),
+            model_delay_samples: AtomicU64::new(0),
+            // Starts at MAX so the first `fetch_min` wins.
+            fill_min: AtomicU64::new(u64::MAX),
+            fill_max: AtomicU64::new(0),
+            fill_sum: AtomicU64::new(0),
+            fill_samples: AtomicU64::new(0),
+            busy_us_total: AtomicU64::new(0),
+        }
     }
 }
 
@@ -281,13 +377,11 @@ where
     let (mut in_tx, mut in_rx) = rtrb::RingBuffer::<f32>::new(RING_FRAMES * HOP_SIZE);
     let (mut out_tx, mut out_rx) = rtrb::RingBuffer::<f32>::new(RING_FRAMES * HOP_SIZE);
 
-    // Pre-fill the output ring with silence so the first output callbacks have
-    // something to read while the worker spins up. Without this the run always
-    // opens with a burst of underruns.
-    let prefill = cfg.target_fill_frames * HOP_SIZE;
-    for _ in 0..prefill {
-        let _ = out_tx.push(0.0);
-    }
+    // No silence prefill. Sizing one against a device block size that is not known
+    // until the first callback is what cost exactly 64 samples on every startup:
+    // a 960-sample prefill covers one 512-frame callback and only 448 of the
+    // second. Instead the streams start in dependency order below, so the ring
+    // holds real audio at the target depth before the output device first pulls.
 
     let s = stats.clone();
     let in_stream = in_dev
@@ -336,7 +430,7 @@ where
                 if starved > 0 {
                     s.output_underruns.fetch_add(starved, Ordering::Relaxed);
                 }
-                s.ring_fill.store(out_rx.slots() as u64, Ordering::Relaxed);
+                s.observe_fill(out_rx.slots() as u64);
             },
             move |e| eprintln!("output stream error: {e}"),
             None,
@@ -346,6 +440,16 @@ where
     let worker_stats = stats.clone();
     let worker_stop = stop.clone();
     let target_fill = cfg.target_fill_frames * HOP_SIZE;
+    // Startup handshake. The output device must not begin pulling until the model
+    // is loaded and the ring is primed with real audio.
+    let model_ready = Arc::new(AtomicBool::new(false));
+    let output_primed = Arc::new(AtomicBool::new(false));
+    let worker_failed = Arc::new(AtomicBool::new(false));
+    let (w_ready, w_primed, w_failed) = (
+        model_ready.clone(),
+        output_primed.clone(),
+        worker_failed.clone(),
+    );
     let worker = std::thread::Builder::new()
         .name("voicemic-dsp".into())
         .spawn(move || {
@@ -358,13 +462,34 @@ where
                 target_fill,
                 worker_stats,
                 worker_stop,
+                w_ready,
+                w_primed,
             ) {
                 eprintln!("worker failed: {e:#}");
+                w_failed.store(true, Ordering::Relaxed);
             }
         })
         .context("spawning worker")?;
 
+    // 1. Model must be loaded and warmed before any device runs. Loading an ONNX
+    //    session takes long enough to drain any plausible prefill.
+    wait_for(
+        &model_ready,
+        &worker_failed,
+        Duration::from_secs(60),
+        "model to load",
+    )?;
+
+    // 2. Input first, so the worker has something to process.
     in_stream.play().context("starting input stream")?;
+
+    // 3. Output only once the ring holds `target_fill` samples of real audio.
+    wait_for(
+        &output_primed,
+        &worker_failed,
+        Duration::from_secs(10),
+        "output ring to prime",
+    )?;
     out_stream.play().context("starting output stream")?;
 
     while !stop.load(Ordering::Relaxed) {
@@ -374,6 +499,21 @@ where
     drop(in_stream);
     drop(out_stream);
     worker.join().map_err(|_| anyhow!("worker panicked"))?;
+    Ok(())
+}
+
+/// Block until `flag` is set, the worker reports failure, or the deadline passes.
+fn wait_for(flag: &AtomicBool, failed: &AtomicBool, timeout: Duration, what: &str) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while !flag.load(Ordering::Relaxed) {
+        if failed.load(Ordering::Relaxed) {
+            bail!("worker failed while waiting for {what}");
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out after {:?} waiting for {what}", timeout);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
     Ok(())
 }
 
@@ -387,15 +527,23 @@ fn worker_loop<F>(
     target_fill: usize,
     stats: Arc<SharedStats>,
     stop: Arc<AtomicBool>,
+    model_ready: Arc<AtomicBool>,
+    output_primed: Arc<AtomicBool>,
 ) -> Result<()>
 where
     F: FnOnce() -> Result<Box<dyn Enhancer>>,
 {
+    match qos::elevate_current_thread() {
+        Ok(()) => println!("worker thread: user-interactive priority"),
+        Err(e) => println!("worker thread: default priority ({e})"),
+    }
+
     let mut enhancer = make_enhancer()?;
     println!("Enhancer: {}", enhancer.describe());
     stats
         .model_delay_samples
         .store(enhancer.delay_samples() as u64, Ordering::Relaxed);
+    model_ready.store(true, Ordering::Relaxed);
 
     // Input rate conversion to the model's fixed 48 kHz. Ratio is constant.
     let mut up = (in_rate != SAMPLE_RATE)
@@ -422,6 +570,7 @@ where
     )
     .map_err(|e| anyhow!("output resampler: {e}"))?;
 
+    let out_capacity = out_tx.buffer().capacity();
     let mut drift = DriftController::new(target_fill);
     let mut times = FrameTimes::new();
 
@@ -468,6 +617,7 @@ where
             enhancer.process_frame(&frame_in, &mut frame_out)?;
             let us = t0.elapsed().as_micros() as u64;
             times.record_us(us);
+            stats.busy_us_total.fetch_add(us, Ordering::Relaxed);
             if us > FRAME_DEADLINE_US {
                 stats.deadline_misses.fetch_add(1, Ordering::Relaxed);
             }
@@ -488,6 +638,15 @@ where
                 .map_err(|e| anyhow!("output resample: {e}"))?;
             for &v in &down_out[0][..produced] {
                 let _ = out_tx.push(v);
+            }
+
+            // Release the output device once the ring carries the jitter buffer's
+            // worth of real audio, so the first callback never reads silence.
+            if !output_primed.load(Ordering::Relaxed) {
+                let fill = out_capacity - out_tx.slots();
+                if fill >= target_fill {
+                    output_primed.store(true, Ordering::Relaxed);
+                }
             }
 
             stats.frames_done.fetch_add(1, Ordering::Relaxed);
@@ -651,6 +810,82 @@ mod tests {
         let ll = stats_with(256, 256, 480).latency_estimate(2).unwrap();
         let std_ = stats_with(256, 256, 1440).latency_estimate(2).unwrap();
         assert!((std_.min_ms() - ll.min_ms() - 20.0).abs() < 0.01);
+    }
+
+    /// Simulate the first second of output: the device drains `block` samples per
+    /// callback while the worker supplies one 480-sample frame every 10 ms.
+    /// Returns the lowest fill reached, or `None` if the ring ran dry.
+    fn simulate_startup(initial_fill: i64, block: i64, worker_running: bool) -> Option<i64> {
+        let sr = 48_000.0_f64;
+        let mut fill = initial_fill;
+        let mut lowest = fill;
+        let mut next_callback = block as f64 / sr;
+        let mut next_frame = HOP_SIZE as f64 / sr;
+        let mut t = 0.0_f64;
+        while t < 1.0 {
+            if next_callback <= next_frame {
+                t = next_callback;
+                next_callback += block as f64 / sr;
+                fill -= block;
+                if fill < 0 {
+                    return None;
+                }
+                lowest = lowest.min(fill);
+            } else {
+                t = next_frame;
+                next_frame += HOP_SIZE as f64 / sr;
+                if worker_running {
+                    fill += HOP_SIZE as i64;
+                }
+            }
+        }
+        Some(lowest)
+    }
+
+    #[test]
+    fn the_old_silence_prefill_could_not_cover_two_callbacks() {
+        // Regression record. Priming 2 x 480 = 960 samples of silence and starting
+        // the output device before the worker produced anything left the second
+        // 512-frame callback 64 samples short, which is exactly what was observed.
+        let starved = simulate_startup(2 * HOP_SIZE as i64, 512, false);
+        assert!(
+            starved.is_none(),
+            "expected the ring to run dry, got {starved:?}"
+        );
+
+        let deficit = 2 * 512 - 2 * HOP_SIZE as i64;
+        assert_eq!(deficit, 64, "the observed startup underrun");
+    }
+
+    #[test]
+    fn priming_to_target_with_the_worker_running_never_starves() {
+        // What the dependency-ordered startup guarantees: the ring holds the jitter
+        // buffer in real audio and the worker is already producing when the output
+        // device is released.
+        for block in [64_i64, 128, 256, 512, 1024] {
+            let lowest = simulate_startup(2 * HOP_SIZE as i64, block, true)
+                .unwrap_or_else(|| panic!("ran dry at block size {block}"));
+            assert!(lowest >= 0, "block {block} reached {lowest}");
+        }
+    }
+
+    #[test]
+    fn fill_window_tracks_extremes_and_resets() {
+        let s = SharedStats::default();
+        assert!(s.take_fill_window().is_none(), "no observations yet");
+
+        for v in [900, 1200, 700, 1000] {
+            s.observe_fill(v);
+        }
+        let (lo, hi, mean) = s.take_fill_window().unwrap();
+        assert_eq!((lo, hi), (700, 1200));
+        assert!((mean - 950.0).abs() < 1e-9);
+
+        // The window must reset, or a single early spike would haunt every report.
+        assert!(s.take_fill_window().is_none());
+        s.observe_fill(500);
+        let (lo, hi, _) = s.take_fill_window().unwrap();
+        assert_eq!((lo, hi), (500, 500));
     }
 
     #[test]

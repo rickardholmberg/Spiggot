@@ -1,6 +1,6 @@
 # First test: DeepFilterNet as a virtual microphone — results
 
-Status: **Phase 1 complete and passed on the target M1 Pro. Phases 2 and 3 not yet run.**
+Status: **Phase 2 running on the target M1 Pro. Live pipeline works; headroom is much tighter than the benchmark implied.**
 
 ## What has been verified
 
@@ -76,7 +76,106 @@ full twelve-configuration matrix runs with a bare environment.
 loader search path -- is the thing that does not work, and `--ort-lib` covers the
 case where discovery fails.
 
-## Phase 1 result: passed, with ~12x headroom
+## Phase 2: the live pipeline runs
+
+`bridge.rs` executed for the first time. Microphone to DeepFilterNet to output
+device, with the drift controller engaged and holding at +0.02 to +0.06%, well
+inside its +/-0.5% band.
+
+```
+latency: input buffer 10.7 + framing 0-10.0 + model 30.0 + jitter 20.0
+         + output buffer 10.7 = 71.3-81.3 ms
+frames 1187 | mean 2.44 p50 2.27 p99 5.73 max 12.56 ms | ring 1178
+            | drift +0.0239% | under 64 over 0 late 1
+```
+
+### The benchmark overstates in-pipeline cost, and the bridge is not at fault
+
+| Context | mean | p99 | max |
+|---|---|---|---|
+| `bench` unpaced, M1 Pro | 0.40 ms | 0.54 ms | 0.86 ms |
+| `run` live, M1 Pro | 2.44 ms | 5.73 ms | 12.56 ms |
+| ratio | 6.1x | 10.6x | 14.6x |
+
+Diagnosed with `bench --pace`, which sleeps to hold a 10 ms cadence and reproduce
+the live duty cycle without any audio path involved. On the Linux container:
+
+| | mean | p99 | max |
+|---|---|---|---|
+| unpaced | 1.26 ms | 2.06 ms | 2.91 ms |
+| paced | 2.39 ms | 3.42 ms | 10.58 ms |
+| ratio | 1.9x | 1.7x | 3.6x |
+
+Pacing alone reproduces most of the inflation, including an occasional frame over
+the 10 ms deadline, with no bridge, no rings and no callbacks in the picture. The
+mechanism is duty cycle: the worker is busy about a quarter of each frame and the
+core clocks down between frames, while an unpaced loop keeps it saturated and
+boosted. On Apple Silicon a default-QoS thread can also land on an efficiency core.
+
+**Consequence: the 12x headroom figure recorded below is an artifact of unpaced
+measurement.** In the live pipeline it is about 2x. That is the number the
+generative-second-stage question has to be answered against.
+
+Mitigation applied: the worker requests `QOS_CLASS_USER_INTERACTIVE` on macOS
+(`pthread_set_qos_class_self_np`). Whether it recovers the gap is not yet measured;
+the comparison against the 2.44 / 5.73 / 12.56 baseline is outstanding.
+
+### Startup lost exactly 64 samples, every time
+
+`under 64` in the first report, never growing, so a startup transient. The
+arithmetic is exact:
+
+```
+prefill = target_fill_frames x HOP_SIZE = 2 x 480 = 960 samples
+output device block                     = 512 frames
+callback 1 takes 512                    -> 448 remain
+callback 2 wants 512, has 448           -> short by 64
+```
+
+Two compounding causes. The prefill was sized in the model's 480-sample frames
+while the device drains in 512-sample blocks, and the output stream was started
+while the worker was still loading and warming the ONNX session, so the prefill was
+the only thing covering that window. It happened to be nearly enough here because
+the model loaded within about three callbacks; a slower load would have produced a
+long burst of silence.
+
+Fixed by dependency-ordered startup rather than a larger guess: the worker loads
+the model and signals ready, the input stream starts, the worker primes the output
+ring to the jitter depth with real audio and signals again, and only then does the
+output device begin pulling. Both waits carry timeouts so a failing model surfaces
+as an error instead of a hang. Two tests encode this, one reproducing the old
+64-sample deficit and one asserting the new order never starves across block sizes
+from 64 to 1024.
+
+This also removed a latent problem: the input stream previously started before the
+worker consumed anything, and the input ring holds only 1.28 s, so a slow model load
+would have overrun it.
+
+### Latency measured, and the target needs both levers
+
+Device buffers came back at **512 frames**, the macOS default. With `dfn3_h0` that
+is 71-81 ms.
+
+| Configuration | Total |
+|---|---|
+| `dfn3_h0`, 512-frame buffers (current) | 71-81 ms |
+| `dfn3_ll`, 512-frame buffers | 51-61 ms |
+| `dfn3_h0`, `--buffer-frames 128` | 55-65 ms |
+| **`dfn3_ll` + `--buffer-frames 128`** | **35-45 ms** |
+
+Neither lever alone reaches ~40 ms. `--jitter-frames 1` would save another 10 ms but
+cannot absorb the 12.56 ms worst frame observed, so it stays off the table until the
+QoS work lands.
+
+### Ring fill was unreadable, now instrumented
+
+Reported fill sawtoothed between 637 and 1178 against a 960-sample target, which
+could not be distinguished from aliasing: the value is written in the output
+callback about 94 times a second and was sampled once a second. The reporter now
+prints min, mean and max across the whole interval, plus the worker's busy fraction.
+Drift gains are deliberately not retuned on 11 seconds of evidence.
+
+## Phase 1 result: unpaced benchmark (ranking only)
 
 M1 Pro, 3000 frames (30 s) per configuration, 1 ONNX intra-op thread, plugged in.
 Times in milliseconds against a 10 ms deadline.
@@ -96,10 +195,10 @@ Times in milliseconds against a 10 ms deadline.
 | dfn2_ll | split | 1.97 | 2.43 | 4.91 | 28.42 | 0.197 | 284% |
 | dfn2 | split | 2.00 | 2.51 | 10.18 | 29.83 | 0.200 | 298% |
 
-**The gate is passed.** `dfn3_h0` combined runs at RTF 0.040 with its worst frame
-at 8.6% of the deadline, against a 50%-of-a-core budget. That is roughly 12x
-headroom and leaves about 0.46 RTF for a generative second stage. Compute is not
-the binding constraint for the front end.
+**These are unpaced numbers and overstate in-pipeline cost about 2x** (see Phase 2
+above). They rank models against each other correctly; they do not size a budget.
+`dfn3_h0` combined is the cheapest configuration measured, and in the live pipeline
+it leaves roughly 2x headroom rather than the 12x this table implies.
 
 The M1 Pro is 2.3-2.8x faster than the Linux container on the same configurations,
 and far more consistent: container means for `dfn3_h0` combined ranged 0.93-1.80 ms

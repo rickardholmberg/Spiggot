@@ -80,6 +80,16 @@ enum Cmd {
         /// threads raise throughput but widen the tail that sizes the buffer.
         #[arg(long, default_value_t = 1)]
         threads: usize,
+        /// Process one frame per 10 ms of wall clock, matching the live pipeline
+        /// instead of running flat out.
+        ///
+        /// An unpaced benchmark keeps a core saturated, so it boosts and stays on a
+        /// performance core. The real worker is busy roughly a quarter of the time
+        /// and sleeps the rest, which lets the core clock down. Measured live
+        /// frame times ran 6x the unpaced benchmark on identical work; this is the
+        /// experiment that says whether duty cycle explains it.
+        #[arg(long)]
+        pace: bool,
     },
 
     /// Enhance a WAV file, for fidelity comparison against upstream `deep-filter`.
@@ -142,12 +152,14 @@ fn main() -> Result<()> {
             frames,
             mode,
             threads,
+            pace,
         } => bench(
             &resolve_model(model.as_deref())?,
             wav,
             frames,
             mode,
             threads,
+            pace,
             ort_lib.as_deref(),
         ),
         Cmd::File {
@@ -444,12 +456,14 @@ fn read_wav_mono_48k(path: &Path) -> Result<Vec<f32>> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench(
     model: &Path,
     wav: Option<PathBuf>,
     frames: usize,
     mode: Mode,
     threads: usize,
+    pace: bool,
     ort_lib: Option<&Path>,
 ) -> Result<()> {
     let mut enh = make_enhancer(model, mode, threads, ort_lib)?;
@@ -466,7 +480,24 @@ fn bench(
 
     let mut out = vec![0.0f32; HOP_SIZE];
     let mut times = FrameTimes::new();
+    let period = std::time::Duration::from_micros(FRAME_DEADLINE_US);
+    let started = std::time::Instant::now();
+    if pace {
+        println!(
+            "paced: one frame per {} ms, {:.0}s wall clock",
+            FRAME_DEADLINE_US / 1000,
+            n_frames as f64 * FRAME_DEADLINE_US as f64 / 1e6
+        );
+    }
     for f in 0..n_frames {
+        if pace {
+            // Sleep until this frame's slot, so the core sees the same idle
+            // fraction it sees in the live pipeline.
+            let slot = started + period * f as u32;
+            if let Some(wait) = slot.checked_duration_since(std::time::Instant::now()) {
+                std::thread::sleep(wait);
+            }
+        }
         let inp = &signal[f * HOP_SIZE..(f + 1) * HOP_SIZE];
         let t0 = std::time::Instant::now();
         enh.process_frame(inp, &mut out)?;
@@ -474,7 +505,11 @@ fn bench(
     }
 
     let audio_s = (n_frames * HOP_SIZE) as f64 / SAMPLE_RATE as f64;
-    println!("\n{} frames ({audio_s:.1}s of audio)", times.count());
+    println!(
+        "\n{} frames ({audio_s:.1}s of audio, {})",
+        times.count(),
+        if pace { "paced" } else { "unpaced" }
+    );
     println!("  mean   {:>8.2} ms", times.mean_us() / 1000.0);
     println!(
         "  p50    {:>8.2} ms",
@@ -601,6 +636,8 @@ fn run(
         let jitter = jitter_frames.max(1);
         std::thread::spawn(move || {
             let mut latency_printed = false;
+            let mut last_busy_us = 0u64;
+            let mut last_report = std::time::Instant::now();
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 // Printed once, as soon as both callbacks have reported the block
@@ -612,15 +649,35 @@ fn run(
                         latency_printed = true;
                     }
                 }
+                // Busy fraction over this interval is the honest statement of CPU
+                // cost; the mean frame time alone does not say how much of each
+                // 10 ms slot was consumed.
+                let busy_now = stats.busy_us_total.load(Ordering::Relaxed);
+                let elapsed_us = last_report.elapsed().as_micros() as f64;
+                let busy_pct = if elapsed_us > 0.0 {
+                    100.0 * (busy_now - last_busy_us) as f64 / elapsed_us
+                } else {
+                    0.0
+                };
+                last_busy_us = busy_now;
+                last_report = std::time::Instant::now();
+
+                let fill = stats
+                    .take_fill_window()
+                    .map(|(lo, hi, mean)| format!("{lo}/{mean:.0}/{hi}"))
+                    .unwrap_or_else(|| "-".to_string());
+
                 println!(
                     "frames {:>7} | mean {:>5.2} p50 {:>5.2} p99 {:>5.2} max {:>5.2} ms | \
-                     ring {:>5} | drift {:+.4}% | under {} over {} late {}",
+                     busy {:>4.1}% | ring lo/avg/hi {:>16} | drift {:+.4}% | \
+                     under {} over {} late {}",
                     stats.frames_done.load(Ordering::Relaxed),
                     stats.mean_us.load(Ordering::Relaxed) as f64 / 1000.0,
                     stats.p50_us.load(Ordering::Relaxed) as f64 / 1000.0,
                     stats.p99_us.load(Ordering::Relaxed) as f64 / 1000.0,
                     stats.max_us.load(Ordering::Relaxed) as f64 / 1000.0,
-                    stats.ring_fill.load(Ordering::Relaxed),
+                    busy_pct,
+                    fill,
                     (stats.drift_ratio() - 1.0) * 100.0,
                     stats.output_underruns.load(Ordering::Relaxed),
                     stats.input_overruns.load(Ordering::Relaxed),

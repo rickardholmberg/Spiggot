@@ -33,11 +33,30 @@ M1 Pro, 3000 frames (30 s) per configuration, 1 ONNX intra-op thread, plugged in
 
 All times in milliseconds against a 10 ms deadline.
 
-### Compute is not the constraint
+### Benchmark numbers overstate in-pipeline cost about 2x
 
-`dfn3_h0` in combined mode uses 4% of one core, with its worst frame at 8.6% of the
-deadline. Against a 50%-of-a-core budget that is roughly 12x headroom, which leaves
-around 0.46 RTF for a generative second stage. The front-end is close to free.
+The table above is an unpaced benchmark: a tight loop that keeps a core saturated,
+so it boosts and stays on a performance core. The live worker is busy roughly a
+quarter of each 10 ms frame and sleeps the rest, which lets the core clock down.
+
+`bench --pace` holds the 10 ms cadence and reproduces that duty cycle. Same binary,
+same model, same thread count:
+
+| | mean | p99 | max |
+|---|---|---|---|
+| unpaced | 1.26 ms | 2.06 ms | 2.91 ms |
+| paced | 2.39 ms | 3.42 ms | 10.58 ms |
+| ratio | 1.9x | 1.7x | 3.6x |
+
+Paced also reproduces the occasional deadline overrun seen live. **Quote paced
+numbers when sizing a budget**; the unpaced ones are only good for ranking models
+against each other.
+
+On the M1 Pro the live pipeline measured mean 2.44, p99 5.73, max 12.56 ms against
+an unpaced bench of 0.40 / 0.54 / 0.86. Against a 50%-of-a-core budget that is about
+**2x headroom, not the 12x the unpaced benchmark implies**. The worker asks for
+`QOS_CLASS_USER_INTERACTIVE` on macOS to reduce the effect; whether that recovers
+the gap is still to be measured.
 
 ### Session mode costs 4.2x, and the library default picks the slow one
 
@@ -155,14 +174,23 @@ voicemic run --bypass
 
 Then set BlackHole 2ch as the microphone in Zoom/Teams/OBS.
 
-`run` prints once a second:
+`run` prints the measured latency once, then a line a second:
 
 ```
-frames    4800 | mean  0.40 p50  0.39 p99  0.54 max  0.86 ms | ring   960 | drift +0.0021% | under 0 over 0 late 0
+latency: input buffer 10.7 + framing 0-10.0 + model 30.0 + jitter 20.0 + output buffer 10.7 = 71.3-81.3 ms
+frames  4800 | mean 2.44 p50 2.27 p99 5.73 max 12.56 ms | busy 24.4% | ring lo/avg/hi 448/961/1472 | drift +0.0239% | under 0 over 0 late 0
 ```
 
-`under`/`over`/`late` are the numbers that decide whether this is usable. A clean
-45-minute run at zero is the pass criterion.
+`under`/`over`/`late` decide whether this is usable; a clean 45-minute run at zero is
+the pass criterion. `busy` is the honest CPU figure. `ring lo/avg/hi` covers the
+whole reporting interval rather than sampling a value that changes ~94 times a
+second, which at 1 Hz is indistinguishable from aliasing of the drain phase.
+
+Startup is dependency-ordered: the worker loads the model, the input stream starts,
+the worker primes the output ring to the jitter depth with real audio, and only then
+does the output device begin pulling. An earlier version pre-filled silence instead
+and lost exactly 64 samples on every startup, because a 960-sample prefill covers one
+512-frame callback and only 448 of the second.
 
 ## Latency
 
