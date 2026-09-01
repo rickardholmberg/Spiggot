@@ -1,0 +1,49 @@
+name: voicemic
+
+on:
+  push:
+    paths: ['voicemic/**', '.github/workflows/voicemic.yml']
+  pull_request:
+    paths: ['voicemic/**', '.github/workflows/voicemic.yml']
+
+jobs:
+  core:
+    # The platform-independent core: stats, drift control, dry/wet alignment.
+    # Runs without an audio device or an ONNX runtime, which is why those parts
+    # are feature-gated in the first place.
+    name: core (no default features)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: voicemic
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: voicemic
+      - run: cargo fmt --check
+      - run: cargo clippy --no-default-features --all-targets -- -D warnings
+      - run: cargo test --no-default-features
+
+  macos:
+    # Full build including cpal (CoreAudio) and deepfilter-rt (ONNX Runtime).
+    # Build only: the runner has no microphone, no BlackHole, and no way to
+    # verify anything the bridge actually does at runtime.
+    name: macos build (all features)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: voicemic
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: voicemic
+      - run: cargo clippy --all-features --all-targets -- -D warnings
+      - run: cargo build --release

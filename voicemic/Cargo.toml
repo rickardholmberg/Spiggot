@@ -1,0 +1,45 @@
+[package]
+name = "voicemic"
+version = "0.1.0"
+edition = "2021"
+description = "Live DeepFilterNet speech enhancement bridged into a macOS virtual microphone"
+license = "BSD-2-Clause"
+publish = false
+
+[features]
+# Default build (macOS): real audio I/O plus DeepFilterNet inference.
+default = ["audio", "dfn"]
+# CoreAudio/cpal device I/O. Off => pure-logic build, testable on any platform.
+audio = ["dep:cpal", "dep:rubato", "dep:rtrb"]
+# DeepFilterNet inference via deepfilter-rt (ONNX Runtime).
+dfn = ["dep:deepfilter-rt", "dep:ort"]
+# Route ONNX Runtime through CoreML instead of CPU. Measure before enabling:
+# for a model this small, per-call dispatch overhead at 100 frames/s can lose to CPU.
+coreml = ["deepfilter-rt/coreml"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hound = "3.5"
+
+cpal = { version = "0.15", optional = true }
+rubato = { version = "0.16", optional = true }
+rtrb = { version = "0.3", optional = true }
+
+# Not published to crates.io, so pinned by revision for reproducible builds.
+deepfilter-rt = { git = "https://github.com/shimondoodkin/deepfilter-rt", rev = "f1a1b27be767a5e62ccc8625017f1737c33a3bf9", optional = true }
+
+# Not used directly. Present only to pin the version that deepfilter-rt resolves.
+# deepfilter-rt requests `ort = "2.0.0-rc.11"`, which is a prerelease range that also
+# matches rc.12+, and rc.13 made `ort::Error` generic. Without this exact pin the
+# build fails inside deepfilter-rt with a missing `From<ort::Error<SessionBuilder>>`.
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["ndarray", "load-dynamic"], optional = true }
+
+[[bin]]
+name = "voicemic"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
