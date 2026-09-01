@@ -598,9 +598,20 @@ fn run(
     let reporter = {
         let stats = stats.clone();
         let stop = stop.clone();
+        let jitter = jitter_frames.max(1);
         std::thread::spawn(move || {
+            let mut latency_printed = false;
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs(1));
+                // Printed once, as soon as both callbacks have reported the block
+                // size CoreAudio actually chose. Everything before this point is
+                // arithmetic over assumed buffer sizes and is not worth quoting.
+                if !latency_printed {
+                    if let Some(est) = stats.latency_estimate(jitter) {
+                        println!("{}", est.report());
+                        latency_printed = true;
+                    }
+                }
                 println!(
                     "frames {:>7} | mean {:>5.2} p50 {:>5.2} p99 {:>5.2} max {:>5.2} ms | \
                      ring {:>5} | drift {:+.4}% | under {} over {} late {}",

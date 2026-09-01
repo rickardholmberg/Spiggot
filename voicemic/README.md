@@ -61,16 +61,17 @@ quality:
 | worst frame | 0.86 ms (8.6%) | 2.79 ms (27.9%) |
 | jitter buffer needed | 2 frames | 2 frames |
 | model algorithmic delay | 30 ms | 10 ms |
-| total end-to-end | ~55-61 ms | ~35-41 ms |
+| model delay contribution | 30 ms | 10 ms |
 | quality (upstream, vs Tract) | corr 0.999991, SNR 47.6 dB | corr 0.999605, SNR 31.0 dB |
 
 `dfn3_ll` costs 2.9x more per frame, but 2.79 ms is still far inside the 10 ms
 deadline, so it needs the same 2-frame jitter buffer as `dfn3_h0`. Its 20 ms
 latency saving is therefore real rather than clawed back by a deeper buffer.
 
-Use `dfn3_h0` when latency does not matter (recording, DAW monitoring) and
-`dfn3_ll` for calls, where it is the only configuration that reaches ~40 ms. Decide
-between them by listening, not by CPU.
+Whether that 20 ms is enough to hit a call target depends on the device buffer,
+which CoreAudio chooses; see [Latency](#latency). Use `dfn3_h0` when latency does
+not matter (recording, DAW monitoring) and `dfn3_ll` for calls. Decide between them
+by listening, not by CPU.
 
 ## Setup
 
@@ -165,24 +166,38 @@ frames    4800 | mean  0.40 p50  0.39 p99  0.54 max  0.86 ms | ring   960 | drif
 
 ## Latency
 
-Total is the sum of device buffer, model delay, jitter buffer, and output buffer.
-The jitter buffer is the tunable term, and `bench` sizes it: it must cover the
-worst frame, not the mean.
+Only two terms are known ahead of time:
 
-Measured worst frames are small enough that both candidate models need the same
-minimum 2-frame buffer, so the model's own algorithmic delay is what separates
-them.
-
-| Term | dfn3_h0 / dfn3 | dfn3_ll |
+| Term | Value | Basis |
 |---|---|---|
-| Device input buffer (128 / 256 frames) | 2.7 / 5.3 ms | same |
-| Model algorithmic delay | 30 ms (1440 samples) | 10 ms (480 samples) |
-| Jitter buffer, 2 frames | 20 ms | 20 ms |
-| Device output buffer | 2.7 / 5.3 ms | same |
-| **Total** | **55-61 ms** | **35-41 ms** |
+| Model algorithmic delay | 10 ms (`_ll`) / 30 ms (others) | `delay_samples()` = `(960 - 480) + lookahead x 480` |
+| Jitter buffer | 10 ms per `--jitter-frames` | by construction: ring held at `frames x 480` samples |
 
-Only `dfn3_ll` reaches the ~40 ms call target. Verify with the impulse click test
-rather than this arithmetic: nothing here has been measured end to end.
+The device buffers are chosen by CoreAudio unless `--buffer-frames` is passed, and
+they land on both sides of the chain, so they dominate the uncertainty. A
+480-sample frame-assembly quantum adds a further 0-10 ms depending on where a
+sample falls relative to the boundary.
+
+`voicemic run` prints the breakdown once both callbacks have reported the block
+size actually negotiated:
+
+```
+latency: input buffer 10.7 + framing 0-10.0 + model 10.0 + jitter 20.0 + output buffer 10.7 = 51.3-61.3 ms
+```
+
+Sensitivity to the device buffer, for `dfn3_ll` with 2 jitter frames:
+
+| Device block | Total (min-max) |
+|---|---|
+| 128 frames | 35-45 ms |
+| 256 frames | 41-51 ms |
+| 512 frames | 51-61 ms |
+
+So the model choice is worth a fixed 20 ms (`dfn3_ll` against `dfn3_h0`) and the
+buffer size is worth up to 16 ms on top. Reaching ~40 ms needs `dfn3_ll` **and**
+small device buffers; `--buffer-frames 128` is the lever.
+
+None of this is measured end to end. The click test is what settles it.
 
 ## Architecture
 

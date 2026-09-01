@@ -134,11 +134,18 @@ buffer as `dfn3_h0` at 0.86 ms. The 20 ms saving is real.
 | worst frame | 0.86 ms | 2.79 ms |
 | jitter buffer needed | 2 frames | 2 frames |
 | model delay | 30 ms | 10 ms |
-| total end-to-end (est.) | 55-61 ms | 35-41 ms |
+| total end-to-end | see below | 20 ms less, whatever the buffers |
 | upstream quality vs Tract | corr 0.999991, SNR 47.6 dB | corr 0.999605, SNR 31.0 dB |
 
-`dfn3_ll` is the only configuration that reaches the ~40 ms call target. The choice
-between the two is now a listening test, not a CPU measurement. What survives from
+`dfn3_ll` saves a fixed 20 ms. Whether that reaches the ~40 ms call target depends
+on the device buffer size, which CoreAudio picks and which had not been measured
+when this was first written -- an earlier revision quoted "35-41 ms" from assumed
+128- and 256-frame buffers, and omitted the 0-10 ms frame-assembly quantum
+entirely. At a 512-frame buffer, a common macOS default, the same configuration is
+51-61 ms. `voicemic run` now prints the breakdown from the block size actually
+negotiated, and `--buffer-frames 128` is the lever if it comes back large.
+
+The choice between the two models is a listening test, not a CPU measurement. What survives from
 the earlier finding is the direction (`_ll` is the more expensive variant, contrary
 to the assumption that a low-latency model would be cheaper) and the combined-mode
 default.

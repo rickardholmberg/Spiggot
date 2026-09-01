@@ -55,11 +55,81 @@ pub struct SharedStats {
     pub ring_fill: AtomicU64,
     /// Drift ratio scaled by 1e9, since atomics cannot hold floats.
     pub drift_ratio_nano: AtomicU64,
+    /// Frames per input callback, as actually delivered by CoreAudio.
+    pub in_block_frames: AtomicU64,
+    /// Frames per output callback, as actually requested by CoreAudio.
+    pub out_block_frames: AtomicU64,
+    /// Enhancer algorithmic delay, in samples.
+    pub model_delay_samples: AtomicU64,
 }
 
 impl SharedStats {
     pub fn drift_ratio(&self) -> f64 {
         self.drift_ratio_nano.load(Ordering::Relaxed) as f64 / 1e9
+    }
+
+    /// End-to-end latency built from what the devices actually negotiated.
+    ///
+    /// Returns `None` until both callbacks have run at least once, because the
+    /// device block size is chosen by CoreAudio and is not known before then.
+    /// Guessing it is how an earlier estimate in this repo came out roughly 20 ms
+    /// optimistic.
+    ///
+    /// The frame-assembly term is a range, not a point: the worker consumes whole
+    /// 480-sample frames, so a sample waits between 0 and one frame depending on
+    /// where it lands relative to the boundary.
+    pub fn latency_estimate(&self, jitter_frames: usize) -> Option<LatencyEstimate> {
+        let inb = self.in_block_frames.load(Ordering::Relaxed);
+        let outb = self.out_block_frames.load(Ordering::Relaxed);
+        if inb == 0 || outb == 0 {
+            return None;
+        }
+        let ms = |frames: u64| frames as f64 * 1000.0 / SAMPLE_RATE as f64;
+        Some(LatencyEstimate {
+            input_buffer_ms: ms(inb),
+            framing_ms: ms(HOP_SIZE as u64),
+            model_ms: ms(self.model_delay_samples.load(Ordering::Relaxed)),
+            jitter_ms: ms((jitter_frames * HOP_SIZE) as u64),
+            output_buffer_ms: ms(outb),
+        })
+    }
+}
+
+/// Latency broken into its terms, all in milliseconds.
+#[derive(Debug, Clone, Copy)]
+pub struct LatencyEstimate {
+    pub input_buffer_ms: f64,
+    /// Upper bound of the frame-assembly quantum; the lower bound is zero.
+    pub framing_ms: f64,
+    pub model_ms: f64,
+    pub jitter_ms: f64,
+    pub output_buffer_ms: f64,
+}
+
+impl LatencyEstimate {
+    /// Best case: a sample arriving right on a frame boundary.
+    pub fn min_ms(&self) -> f64 {
+        self.input_buffer_ms + self.model_ms + self.jitter_ms + self.output_buffer_ms
+    }
+
+    /// Worst case: a sample arriving just after one.
+    pub fn max_ms(&self) -> f64 {
+        self.min_ms() + self.framing_ms
+    }
+
+    pub fn report(&self) -> String {
+        format!(
+            "latency: input buffer {:.1} + framing 0-{:.1} + model {:.1} + jitter {:.1} \
+             + output buffer {:.1} = {:.1}-{:.1} ms (measured device blocks; \
+             confirm with a click test)",
+            self.input_buffer_ms,
+            self.framing_ms,
+            self.model_ms,
+            self.jitter_ms,
+            self.output_buffer_ms,
+            self.min_ms(),
+            self.max_ms(),
+        )
     }
 }
 
@@ -225,6 +295,8 @@ where
             &in_cfg,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 // Downmix to mono. The MacBook array already beamforms upstream of us.
+                s.in_block_frames
+                    .store((data.len() / in_ch) as u64, Ordering::Relaxed);
                 let mut dropped = 0u64;
                 for frame in data.chunks(in_ch) {
                     let mono = frame.iter().sum::<f32>() / in_ch as f32;
@@ -246,6 +318,8 @@ where
         .build_output_stream(
             &out_cfg,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                s.out_block_frames
+                    .store((data.len() / out_ch) as u64, Ordering::Relaxed);
                 let mut starved = 0u64;
                 for frame in data.chunks_mut(out_ch) {
                     let v = match out_rx.pop() {
@@ -319,6 +393,9 @@ where
 {
     let mut enhancer = make_enhancer()?;
     println!("Enhancer: {}", enhancer.describe());
+    stats
+        .model_delay_samples
+        .store(enhancer.delay_samples() as u64, Ordering::Relaxed);
 
     // Input rate conversion to the model's fixed 48 kHz. Ratio is constant.
     let mut up = (in_rate != SAMPLE_RATE)
@@ -517,4 +594,70 @@ pub fn doctor_devices() -> bool {
     }
 
     ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats_with(in_b: u64, out_b: u64, model_delay: u64) -> SharedStats {
+        let s = SharedStats::default();
+        s.in_block_frames.store(in_b, Ordering::Relaxed);
+        s.out_block_frames.store(out_b, Ordering::Relaxed);
+        s.model_delay_samples.store(model_delay, Ordering::Relaxed);
+        s
+    }
+
+    #[test]
+    fn no_estimate_before_the_devices_have_reported() {
+        // Refusing to guess is the point: an earlier estimate in this repo assumed
+        // 128- and 256-frame buffers and came out roughly 20 ms optimistic.
+        let s = SharedStats::default();
+        assert!(s.latency_estimate(2).is_none());
+
+        let s = stats_with(512, 0, 480);
+        assert!(
+            s.latency_estimate(2).is_none(),
+            "one callback is not enough"
+        );
+    }
+
+    #[test]
+    fn dfn3_ll_with_512_frame_buffers() {
+        // 512 frames is a common CoreAudio default. dfn3_ll: 480 samples delay.
+        let s = stats_with(512, 512, 480);
+        let e = s.latency_estimate(2).unwrap();
+        assert!((e.input_buffer_ms - 10.667).abs() < 0.01);
+        assert!((e.model_ms - 10.0).abs() < 0.01);
+        assert!((e.jitter_ms - 20.0).abs() < 0.01);
+        assert!((e.framing_ms - 10.0).abs() < 0.01);
+        // 10.67 + 10 + 20 + 10.67 = 51.3, plus up to one frame of assembly.
+        assert!((e.min_ms() - 51.33).abs() < 0.05, "min was {}", e.min_ms());
+        assert!((e.max_ms() - 61.33).abs() < 0.05, "max was {}", e.max_ms());
+    }
+
+    #[test]
+    fn dfn3_ll_with_128_frame_buffers() {
+        let s = stats_with(128, 128, 480);
+        let e = s.latency_estimate(2).unwrap();
+        // The optimistic case quoted earlier, and it still omits framing.
+        assert!((e.min_ms() - 35.33).abs() < 0.05, "min was {}", e.min_ms());
+        assert!((e.max_ms() - 45.33).abs() < 0.05, "max was {}", e.max_ms());
+    }
+
+    #[test]
+    fn standard_model_costs_20ms_more_than_the_ll_variant() {
+        // dfn3/dfn3_h0 carry 1440 samples of delay against dfn3_ll's 480.
+        let ll = stats_with(256, 256, 480).latency_estimate(2).unwrap();
+        let std_ = stats_with(256, 256, 1440).latency_estimate(2).unwrap();
+        assert!((std_.min_ms() - ll.min_ms() - 20.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn each_jitter_frame_costs_ten_milliseconds() {
+        let s = stats_with(256, 256, 480);
+        let two = s.latency_estimate(2).unwrap().min_ms();
+        let three = s.latency_estimate(3).unwrap().min_ms();
+        assert!((three - two - 10.0).abs() < 0.01);
+    }
 }
