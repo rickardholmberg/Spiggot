@@ -1,22 +1,20 @@
 # First test: DeepFilterNet as a virtual microphone — results
 
-Status: **Phase 1 complete off-target. First M1 Pro measurement taken. Phases 2 and 3 not yet run.**
+Status: **Phase 1 complete and passed on the target M1 Pro. Phases 2 and 3 not yet run.**
 
 ## What has been verified
 
 | Claim | Method | Result |
 |---|---|---|
 | `deepfilter-rt` builds and runs | `cargo build`, `voicemic bench` | Yes, after two fixes below |
-| Per-frame cost and tail | 800-frame benchmark, 6 configs | Table below |
-| Session mode dominates cost | benchmark matrix | ~2.3x, and the library default picks the slow mode |
-| `dfn3_ll` is cheaper than `dfn3` | benchmark matrix | **False** — it costs 2.3x more |
+| Per-frame cost and tail | 3000-frame benchmark, 12 configs, M1 Pro | Table below |
+| Session mode dominates cost | benchmark matrix | 4.2x on M1 Pro, and the library default picks the slow mode |
+| `dfn3_ll` is cheaper than `dfn3` | benchmark matrix | **False** — 2.9x more on M1 Pro |
 | Drift controller converges | closed-loop unit test | Converges under 0.1% clock mismatch |
 | All feature combinations compile | `cargo check` × 3 | Clean, no warnings |
 
 ## What has NOT been verified
 
-- **Nothing has run on an M1 Pro.** All numbers below are x86_64 Linux. The
-  relative ordering should carry; absolute values will not.
 - **`bridge.rs` has never executed.** It typechecks against cpal 0.15, rubato
   0.16 and rtrb 0.3, and no audio has passed through it. Every runtime property
   — XRun behaviour, drift correction against real hardware clocks, device
@@ -78,22 +76,72 @@ full twelve-configuration matrix runs with a bare environment.
 loader search path -- is the thing that does not work, and `--ort-lib` covers the
 case where discovery fails.
 
-## First M1 Pro measurement
+## Phase 1 result: passed, with ~12x headroom
 
-`dfn3_h0`, combined streaming, 1 thread, 100 frames, plugged in:
+M1 Pro, 3000 frames (30 s) per configuration, 1 ONNX intra-op thread, plugged in.
+Times in milliseconds against a 10 ms deadline.
 
-| | M1 Pro | Linux container |
+| Model | Mode | mean | p99 | p99.9 | max | RTF | worst vs deadline |
+|---|---|---|---|---|---|---|---|
+| dfn3_h0 | combined | 0.40 | 0.54 | 0.62 | 0.86 | 0.040 | 8.6% |
+| dfn2_h0 | combined | 0.46 | 0.62 | 0.74 | 0.83 | 0.046 | 8.3% |
+| dfn3 | combined | 0.41 | 0.56 | 0.85 | 1.01 | 0.041 | 10.1% |
+| dfn2_ll | combined | 0.46 | 0.67 | 0.91 | 1.15 | 0.046 | 11.5% |
+| dfn2 | combined | 0.46 | 0.64 | 0.78 | 1.46 | 0.046 | 14.6% |
+| dfn3_ll | combined | 1.15 | 1.55 | 2.45 | 2.79 | 0.115 | 27.9% |
+| dfn2_h0 | split | 1.95 | 2.40 | 2.54 | 3.32 | 0.195 | 33.2% |
+| dfn3_h0 | split | 1.69 | 2.16 | 2.61 | 3.71 | 0.169 | 37.1% |
+| dfn3_ll | split | 2.78 | 3.30 | 3.74 | 4.11 | 0.278 | 41.1% |
+| dfn3 | split | 1.78 | 2.26 | 3.57 | 9.45 | 0.178 | 94.5% |
+| dfn2_ll | split | 1.97 | 2.43 | 4.91 | 28.42 | 0.197 | 284% |
+| dfn2 | split | 2.00 | 2.51 | 10.18 | 29.83 | 0.200 | 298% |
+
+**The gate is passed.** `dfn3_h0` combined runs at RTF 0.040 with its worst frame
+at 8.6% of the deadline, against a 50%-of-a-core budget. That is roughly 12x
+headroom and leaves about 0.46 RTF for a generative second stage. Compute is not
+the binding constraint for the front end.
+
+The M1 Pro is 2.3-2.8x faster than the Linux container on the same configurations,
+and far more consistent: container means for `dfn3_h0` combined ranged 0.93-1.80 ms
+across three runs of the same build, against 0.40 ms here.
+
+### Session mode costs 4.2x
+
+Split streaming costs 4.2-4.3x the mean of combined on every model measured, wider
+than the 2.3x seen in the container and wider than the ~3x upstream reports.
+`SessionMode::Auto` selects split whenever the split ONNX files are present, which
+every bundled model directory has, so the library default is the expensive one.
+
+Split tails are also much worse. Combined holds max within 1.3-2.3x of p99; split
+reaches 11.9x on `dfn2`, whose p99.9 of 10.18 ms is already over deadline. The two
+~29 ms outliers (`dfn2` and `dfn2_ll` split) landed on consecutive runs and may be
+an extrinsic scheduling event rather than the model. Not worth chasing: split loses
+on the mean regardless.
+
+### Correction: the earlier argument against dfn3_ll was wrong
+
+Recorded because it changed a recommendation. Based on container measurements this
+document previously argued that `dfn3_ll` was the wrong default, reasoning that its
+higher per-frame cost would force a deeper jitter buffer and hand back the 20 ms of
+algorithmic delay it saves.
+
+The premise does not hold on the target hardware. `dfn3_ll`'s worst frame is
+2.79 ms, well inside the 10 ms deadline, so it needs the same minimum 2-frame
+buffer as `dfn3_h0` at 0.86 ms. The 20 ms saving is real.
+
+| | dfn3_h0 combined | dfn3_ll combined |
 |---|---|---|
-| mean | 0.47 ms | 0.93-1.80 ms |
-| max | 0.74 ms | 1.26-2.80 ms |
-| RTF | 0.047 | 0.093-0.180 |
+| worst frame | 0.86 ms | 2.79 ms |
+| jitter buffer needed | 2 frames | 2 frames |
+| model delay | 30 ms | 10 ms |
+| total end-to-end (est.) | 55-61 ms | 35-41 ms |
+| upstream quality vs Tract | corr 0.999991, SNR 47.6 dB | corr 0.999605, SNR 31.0 dB |
 
-The worst frame used **7% of the 10 ms deadline**, against a budget of 50%.
-
-Provisional: one second of audio, plugged in, and the tail is what sizes the jitter
-buffer. Container figures move substantially run to run (`dfn3_h0` combined measured
-0.93, 1.14 and 1.80 ms mean across three runs), so only M1 Pro numbers should be
-quoted. The ordering has held in every run.
+`dfn3_ll` is the only configuration that reaches the ~40 ms call target. The choice
+between the two is now a listening test, not a CPU measurement. What survives from
+the earlier finding is the direction (`_ll` is the more expensive variant, contrary
+to the assumption that a low-latency model would be cheaper) and the combined-mode
+default.
 
 ## Benchmark (container, ordering only)
 
@@ -158,9 +206,9 @@ worth reporting upstream.
 
 ## Next steps
 
-1. Re-run `scripts/bench_matrix.sh` on the M1 Pro now that it works, plugged in and
-   on battery. Battery matters: the chip downclocks and may schedule onto
-   efficiency cores.
+1. Re-run the matrix **on battery**. Done plugged in; the chip downclocks and may
+   schedule onto efficiency cores, and the jitter buffer must be sized for the
+   worse case.
 2. Compare `voicemic file --align` against upstream `deep-filter -D` and check
    correlation (upstream reports 0.999991 for combined streaming).
 3. Measure the CoreML feature against CPU. At 100 frames/s, per-call dispatch

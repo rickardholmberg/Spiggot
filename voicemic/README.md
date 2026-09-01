@@ -14,31 +14,63 @@ and the open-source baseline row for later evaluation.
 
 ## Measured results
 
-Full numbers and caveats in `../docs/first-test-results.md`. Two findings drive
-the defaults:
+M1 Pro, 3000 frames (30 s) per configuration, 1 ONNX intra-op thread, plugged in.
 
-**Session mode costs ~2.3x, and the library's default picks the slow one.**
+| Model | Mode | mean | p99 | p99.9 | max | RTF | worst frame vs deadline |
+|---|---|---|---|---|---|---|---|
+| **dfn3_h0** | **combined** | **0.40** | **0.54** | **0.62** | **0.86** | **0.040** | **8.6%** |
+| dfn2_h0 | combined | 0.46 | 0.62 | 0.74 | 0.83 | 0.046 | 8.3% |
+| dfn3 | combined | 0.41 | 0.56 | 0.85 | 1.01 | 0.041 | 10.1% |
+| dfn2 | combined | 0.46 | 0.64 | 0.78 | 1.46 | 0.046 | 14.6% |
+| dfn2_ll | combined | 0.46 | 0.67 | 0.91 | 1.15 | 0.046 | 11.5% |
+| **dfn3_ll** | **combined** | **1.15** | **1.55** | **2.45** | **2.79** | **0.115** | **27.9%** |
+| dfn3_h0 | split | 1.69 | 2.16 | 2.61 | 3.71 | 0.169 | 37.1% |
+| dfn3 | split | 1.78 | 2.26 | 3.57 | 9.45 | 0.178 | 94.5% |
+| dfn2_h0 | split | 1.95 | 2.40 | 2.54 | 3.32 | 0.195 | 33.2% |
+| dfn3_ll | split | 2.78 | 3.30 | 3.74 | 4.11 | 0.278 | 41.1% |
+| dfn2_ll | split | 1.97 | 2.43 | 4.91 | 28.42 | 0.197 | 284% |
+| dfn2 | split | 2.00 | 2.51 | 10.18 | 29.83 | 0.200 | 298% |
+
+All times in milliseconds against a 10 ms deadline.
+
+### Compute is not the constraint
+
+`dfn3_h0` in combined mode uses 4% of one core, with its worst frame at 8.6% of the
+deadline. Against a 50%-of-a-core budget that is roughly 12x headroom, which leaves
+around 0.46 RTF for a generative second stage. The front-end is close to free.
+
+### Session mode costs 4.2x, and the library default picks the slow one
+
 `deepfilter-rt`'s `SessionMode::Auto` prefers split streaming whenever the split
-ONNX files are present, which every bundled model directory has. Combined
-streaming is the default here instead.
+ONNX files are present, which every bundled model directory has. Split costs
+4.2-4.3x the mean of combined on every model measured. `voicemic` defaults to
+`--mode combined`.
 
-**The low-latency variant is the expensive one.** `dfn3_ll` trades 20 ms of
-algorithmic delay for 2.3x the per-frame cost. `dfn3_h0` was both the cheapest
-and, per upstream, the best quality — at 30 ms delay.
+Split also has far worse tails. Combined keeps max within 1.3-2.3x of p99; split
+reaches 11.9x on `dfn2`, with a p99.9 of 10.18 ms that is already over deadline.
+The two ~29 ms outliers landed on consecutive runs and may be an extrinsic
+scheduling event rather than the model, but split loses on the mean anyway.
 
-| Model | Mode | mean | p99 | max | RTF |
-|---|---|---|---|---|---|
-| dfn3_h0 | combined | 0.93 ms | 1.17 ms | 1.26 ms | 0.093 |
-| dfn3 | combined | 1.06 ms | 1.41 ms | 1.47 ms | 0.106 |
-| dfn3_h0 | split | 2.32 ms | 3.10 ms | 3.48 ms | 0.232 |
-| dfn3 | split | 2.44 ms | 3.36 ms | 3.43 ms | 0.244 |
-| dfn3_ll | combined | 2.48 ms | 3.04 ms | 3.22 ms | 0.248 |
-| dfn3_ll | split | 3.76 ms | 5.01 ms | 5.23 ms | 0.376 |
+### Model choice is a quality decision, not a cost one
 
-Measured on x86_64 Linux, 1 ONNX thread, 800 frames of synthetic input. **These
-are not M1 Pro numbers.** The ordering should carry across architectures; the
-absolute values will not. Re-run `scripts/bench_matrix.sh` on the target machine
-before drawing conclusions.
+Both candidates fit the CPU budget with room to spare, so pick on latency and
+quality:
+
+| | `dfn3_h0` combined | `dfn3_ll` combined |
+|---|---|---|
+| worst frame | 0.86 ms (8.6%) | 2.79 ms (27.9%) |
+| jitter buffer needed | 2 frames | 2 frames |
+| model algorithmic delay | 30 ms | 10 ms |
+| total end-to-end | ~55-61 ms | ~35-41 ms |
+| quality (upstream, vs Tract) | corr 0.999991, SNR 47.6 dB | corr 0.999605, SNR 31.0 dB |
+
+`dfn3_ll` costs 2.9x more per frame, but 2.79 ms is still far inside the 10 ms
+deadline, so it needs the same 2-frame jitter buffer as `dfn3_h0`. Its 20 ms
+latency saving is therefore real rather than clawed back by a deeper buffer.
+
+Use `dfn3_h0` when latency does not matter (recording, DAW monitoring) and
+`dfn3_ll` for calls, where it is the only configuration that reaches ~40 ms. Decide
+between them by listening, not by CPU.
 
 ## Setup
 
@@ -125,7 +157,7 @@ Then set BlackHole 2ch as the microphone in Zoom/Teams/OBS.
 `run` prints once a second:
 
 ```
-frames    4800 | mean  0.93 p50  0.90 p99  1.17 max  1.26 ms | ring  1440 | drift +0.0021% | under 0 over 0 late 0
+frames    4800 | mean  0.40 p50  0.39 p99  0.54 max  0.86 ms | ring   960 | drift +0.0021% | under 0 over 0 late 0
 ```
 
 `under`/`over`/`late` are the numbers that decide whether this is usable. A clean
@@ -137,14 +169,20 @@ Total is the sum of device buffer, model delay, jitter buffer, and output buffer
 The jitter buffer is the tunable term, and `bench` sizes it: it must cover the
 worst frame, not the mean.
 
+Measured worst frames are small enough that both candidate models need the same
+minimum 2-frame buffer, so the model's own algorithmic delay is what separates
+them.
+
 | Term | dfn3_h0 / dfn3 | dfn3_ll |
 |---|---|---|
+| Device input buffer (128 / 256 frames) | 2.7 / 5.3 ms | same |
 | Model algorithmic delay | 30 ms (1440 samples) | 10 ms (480 samples) |
-| Jitter buffer (`--jitter-frames`) | 10 ms per frame | 10 ms per frame |
-| Device buffers | set by `--buffer-frames` | same |
+| Jitter buffer, 2 frames | 20 ms | 20 ms |
+| Device output buffer | 2.7 / 5.3 ms | same |
+| **Total** | **55-61 ms** | **35-41 ms** |
 
-`dfn3_ll` buys 20 ms of model delay at 2.3x the per-frame cost, which may push the
-jitter buffer back up and give the 20 ms straight back. Measure both.
+Only `dfn3_ll` reaches the ~40 ms call target. Verify with the impulse click test
+rather than this arithmetic: nothing here has been measured end to end.
 
 ## Architecture
 

@@ -113,7 +113,11 @@ enum Cmd {
         threads: usize,
         /// Jitter buffer depth in 480-sample frames. Each frame costs 10 ms of
         /// latency, so this is the number to minimise once the tail is known.
-        #[arg(long, default_value_t = 3)]
+        ///
+        /// Default 2, which is what `bench` recommends: the measured worst frame
+        /// on an M1 Pro is 0.86 ms for dfn3_h0 combined, far inside the 10 ms
+        /// deadline. Raise it if the stats line reports underruns.
+        #[arg(long, default_value_t = 2)]
         jitter_frames: usize,
         /// Device buffer size in frames.
         #[arg(long)]
