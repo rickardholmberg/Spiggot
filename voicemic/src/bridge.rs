@@ -436,3 +436,85 @@ where
     }
     Ok(())
 }
+
+/// Device and permission checks for `voicemic doctor`. Returns true if all passed.
+///
+/// Opening an input stream is the only reliable way to tell whether the process
+/// actually holds a microphone grant: a binary run from a terminal inherits the
+/// terminal's TCC decision, which silently misleads until it is wrapped in a
+/// signed `.app` with `NSMicrophoneUsageDescription`.
+pub fn doctor_devices() -> bool {
+    fn line(label: &str, ok: bool, detail: impl std::fmt::Display) -> bool {
+        println!("  [{}] {label}: {detail}", if ok { "ok" } else { "FAIL" });
+        ok
+    }
+
+    let host = cpal::default_host();
+
+    let inputs: Vec<String> = host
+        .input_devices()
+        .map(|ds| ds.filter_map(|d| d.name().ok()).collect())
+        .unwrap_or_default();
+    let outputs: Vec<String> = host
+        .output_devices()
+        .map(|ds| ds.filter_map(|d| d.name().ok()).collect())
+        .unwrap_or_default();
+
+    let mut ok = line("input devices", !inputs.is_empty(), inputs.len());
+    ok &= line("output devices", !outputs.is_empty(), outputs.len());
+
+    let blackhole = outputs
+        .iter()
+        .any(|n| n.to_lowercase().contains("blackhole"));
+    // Not fatal: bench and file need no virtual device, only `run` does.
+    line(
+        "BlackHole",
+        blackhole,
+        if blackhole {
+            "present"
+        } else {
+            "absent - `run` needs it (brew install --cask blackhole-2ch), bench does not"
+        },
+    );
+
+    match host.default_input_device() {
+        Some(dev) => {
+            let name = dev.name().unwrap_or_else(|_| "<unknown>".into());
+            match dev.default_input_config() {
+                Ok(cfg) => {
+                    ok &= line(
+                        "default input",
+                        true,
+                        format!("{name} @ {} Hz, {} ch", cfg.sample_rate().0, cfg.channels()),
+                    );
+                    // Building the stream is what triggers the TCC prompt or denial.
+                    let built = dev.build_input_stream(
+                        &cfg.config(),
+                        |_: &[f32], _: &cpal::InputCallbackInfo| {},
+                        |_| {},
+                        None,
+                    );
+                    ok &= match built {
+                        Ok(s) => {
+                            let played = s.play().is_ok();
+                            line(
+                                "microphone permission",
+                                played,
+                                if played {
+                                    "input stream opened"
+                                } else {
+                                    "stream built but would not start"
+                                },
+                            )
+                        }
+                        Err(e) => line("microphone permission", false, format!("{e}")),
+                    };
+                }
+                Err(e) => ok &= line("default input", false, format!("{name}: {e}")),
+            }
+        }
+        None => ok &= line("default input", false, "none"),
+    }
+
+    ok
+}

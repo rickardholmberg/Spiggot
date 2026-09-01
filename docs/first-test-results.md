@@ -1,6 +1,6 @@
 # First test: DeepFilterNet as a virtual microphone — results
 
-Status: **Phase 1 complete off-target. Phases 2 and 3 not yet run.**
+Status: **Phase 1 complete off-target. First M1 Pro measurement taken. Phases 2 and 3 not yet run.**
 
 ## What has been verified
 
@@ -27,10 +27,79 @@ Status: **Phase 1 complete off-target. Phases 2 and 3 not yet run.**
   Inference cost is input-independent for this architecture, but nobody has
   listened to the output.
 
-## Benchmark
+## The macOS failure, and what caused it
+
+The first run of `scripts/bench_matrix.sh` on the M1 Pro reported `FAILED` for all
+twelve configurations. The same binary invoked directly worked:
+
+```
+$ ./target/release/voicemic bench /tmp/dfrt/models/dfn3_h0 --frames 100
+Model: DeepFilterNet3-H0 [combined streaming] 1 threads, delay 1440 samples
+  mean 0.47 ms   p99 0.62 ms   max 0.74 ms   RTF 0.047
+```
+
+**Cause: macOS SIP strips `DYLD_*` when a protected system binary is executed.**
+Running the script executes `/usr/bin/env` and then `bash`, both protected, so the
+`DYLD_LIBRARY_PATH` that made the direct invocation work was gone before `voicemic`
+started. Reproduced in the Linux container, which shows the identical split: with
+`LD_LIBRARY_PATH` set the script produces the full matrix, without it all twelve
+rows fail.
+
+Two separate defects:
+
+- **Design.** `voicemic` depended on ambient shell state to find its own runtime.
+  The original workaround, `scripts/ort_env.sh`, printed a `DYLD_LIBRARY_PATH`
+  export line for the user to copy; given SIP that could only ever work for direct
+  invocation from an interactive shell.
+- **Reporting.** `bench_matrix.sh` captured stdout and stderr and discarded them on
+  failure, so a one-line environment problem presented as twelve identical `FAILED`
+  rows with no diagnostic. This is what turned it into a round-trip.
+
+### Fix
+
+`voicemic` now loads ONNX Runtime itself, by absolute path, before `deepfilter-rt`
+attempts its hardcoded leaf-name lookup. `ort` caches the handle in a `OnceLock`
+populated through `get_or_try_init` (`ort/src/lib.rs:131`), so the later lookup
+finds the library already loaded and returns `Ok` without searching. No environment
+variable is involved, and it survives the hardened runtime the signed `.app` will
+need.
+
+`build.rs` records the path at build time from `deepfilter-rt`'s
+`cargo:ort_lib_dir` metadata (it declares `links = "deepfilter_rt"`, so Cargo
+forwards it as `DEP_DEEPFILTER_RT_ORT_LIB_DIR`). The same mechanism supplies
+`cargo:models_dir`, so the bundled models resolve automatically and no separate
+clone is needed.
+
+Verified on Linux, which takes the identical `not(android), not(windows)` code
+path: `env -u LD_LIBRARY_PATH -u ORT_DYLIB_PATH voicemic bench` succeeds, and the
+full twelve-configuration matrix runs with a bare environment.
+
+`scripts/ort_env.sh` was deleted rather than demoted. Its premise -- exporting a
+loader search path -- is the thing that does not work, and `--ort-lib` covers the
+case where discovery fails.
+
+## First M1 Pro measurement
+
+`dfn3_h0`, combined streaming, 1 thread, 100 frames, plugged in:
+
+| | M1 Pro | Linux container |
+|---|---|---|
+| mean | 0.47 ms | 0.93-1.80 ms |
+| max | 0.74 ms | 1.26-2.80 ms |
+| RTF | 0.047 | 0.093-0.180 |
+
+The worst frame used **7% of the 10 ms deadline**, against a budget of 50%.
+
+Provisional: one second of audio, plugged in, and the tail is what sizes the jitter
+buffer. Container figures move substantially run to run (`dfn3_h0` combined measured
+0.93, 1.14 and 1.80 ms mean across three runs), so only M1 Pro numbers should be
+quoted. The ordering has held in every run.
+
+## Benchmark (container, ordering only)
 
 x86_64 Linux container, 1 ONNX intra-op thread, 800 frames (8 s) of synthetic
-input, ONNX Runtime 1.23.2 CPU, `combined` and `split` session modes.
+input, ONNX Runtime 1.23.2 CPU, `combined` and `split` session modes. Absolute
+values are noise-dominated in this environment; read the ordering, not the numbers.
 
 | Model | Mode | mean | p99 | max | RTF | % of 10 ms deadline (worst) |
 |---|---|---|---|---|---|---|
@@ -89,8 +158,9 @@ worth reporting upstream.
 
 ## Next steps
 
-1. Run `scripts/bench_matrix.sh` on the M1 Pro, plugged in and on battery. Battery
-   matters: the chip downclocks and may schedule onto efficiency cores.
+1. Re-run `scripts/bench_matrix.sh` on the M1 Pro now that it works, plugged in and
+   on battery. Battery matters: the chip downclocks and may schedule onto
+   efficiency cores.
 2. Compare `voicemic file --align` against upstream `deep-filter -D` and check
    correlation (upstream reports 0.999991 for combined streaming).
 3. Measure the CoreML feature against CPU. At 100 frames/s, per-call dispatch

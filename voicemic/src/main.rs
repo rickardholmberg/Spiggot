@@ -4,8 +4,12 @@
 //! machine. Mean cost is not the constraint for real-time audio; a frame that
 //! occasionally overruns its 10 ms deadline forces a larger jitter buffer, and the
 //! jitter buffer dominates end-to-end latency.
+//!
+//! `doctor` exists because the first failure on the target machine presented as
+//! twelve identical `FAILED` rows with no diagnostic. Every environmental
+//! precondition is now checkable with one command.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(feature = "audio")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "audio")]
@@ -14,7 +18,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use voicemic::stats::FrameTimes;
-use voicemic::{FRAME_DEADLINE_US, HOP_SIZE, SAMPLE_RATE};
+use voicemic::{ort_setup, FRAME_DEADLINE_US, HOP_SIZE, SAMPLE_RATE};
 
 #[derive(Parser)]
 #[command(
@@ -22,14 +26,22 @@ use voicemic::{FRAME_DEADLINE_US, HOP_SIZE, SAMPLE_RATE};
     about = "Live DeepFilterNet enhancement into a virtual microphone"
 )]
 struct Cli {
+    /// Path to the ONNX Runtime library.
+    ///
+    /// Rarely needed: the path is recorded at build time. It exists because
+    /// `deepfilter-rt` ignores `ORT_DYLIB_PATH`, and because macOS SIP strips
+    /// `DYLD_*` when a shell runs, so an exported search path cannot be relied on.
+    #[arg(long, global = true, value_name = "PATH")]
+    ort_lib: Option<PathBuf>,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 /// ONNX session layout.
 ///
-/// This choice matters more than the model choice. Upstream measures, on the same
-/// audio: combined streaming RTF 0.11, split streaming RTF 0.34, stateless window
+/// This choice matters more than the model choice. Measured on the same audio:
+/// combined streaming RTF 0.11, split streaming RTF 0.34, stateless window
 /// 0.5-4.0. `deepfilter-rt`'s own `Auto` prefers split whenever the split files
 /// are present, which every bundled model directory has, so leaving it on Auto
 /// silently costs about 3x. Combined is the default here.
@@ -43,13 +55,19 @@ enum Mode {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Check every precondition and report what is wrong.
+    Doctor {
+        /// Model directory to validate. Defaults to the bundled `dfn3_h0`.
+        model: Option<PathBuf>,
+    },
+
     /// List CoreAudio devices and their supported sample rates.
     ListDevices,
 
     /// Measure per-frame cost on this machine. Run this before anything else.
     Bench {
-        /// Model directory, e.g. deepfilter-rt/models/dfn3
-        model: PathBuf,
+        /// Model directory. Defaults to the bundled `dfn3_h0`.
+        model: Option<PathBuf>,
         /// 48 kHz mono WAV to process. Without one, a synthetic signal is used.
         #[arg(long)]
         wav: Option<PathBuf>,
@@ -66,9 +84,10 @@ enum Cmd {
 
     /// Enhance a WAV file, for fidelity comparison against upstream `deep-filter`.
     File {
-        model: PathBuf,
         input: PathBuf,
         output: PathBuf,
+        #[arg(long)]
+        model: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = Mode::Combined)]
         mode: Mode,
         #[arg(long, default_value_t = 1)]
@@ -80,7 +99,8 @@ enum Cmd {
 
     /// Run the live bridge: microphone -> DeepFilterNet -> virtual output device.
     Run {
-        model: PathBuf,
+        /// Model directory. Defaults to the bundled `dfn3_h0`.
+        model: Option<PathBuf>,
         /// Input device name substring. Defaults to the system default input.
         #[arg(long)]
         input: Option<String>,
@@ -107,7 +127,10 @@ enum Cmd {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let ort_lib = cli.ort_lib.clone();
+
     match cli.cmd {
+        Cmd::Doctor { model } => doctor(model.as_deref(), ort_lib.as_deref()),
         Cmd::ListDevices => list_devices(),
         Cmd::Bench {
             model,
@@ -115,15 +138,30 @@ fn main() -> Result<()> {
             frames,
             mode,
             threads,
-        } => bench(model, wav, frames, mode, threads),
+        } => bench(
+            &resolve_model(model.as_deref())?,
+            wav,
+            frames,
+            mode,
+            threads,
+            ort_lib.as_deref(),
+        ),
         Cmd::File {
+            input,
+            output,
             model,
+            mode,
+            threads,
+            align,
+        } => file(
+            &resolve_model(model.as_deref())?,
             input,
             output,
             mode,
             threads,
             align,
-        } => file(model, input, output, mode, threads, align),
+            ort_lib.as_deref(),
+        ),
         Cmd::Run {
             model,
             input,
@@ -134,7 +172,7 @@ fn main() -> Result<()> {
             buffer_frames,
             bypass,
         } => run(
-            model,
+            resolve_model(model.as_deref())?,
             input,
             output,
             mode,
@@ -142,8 +180,27 @@ fn main() -> Result<()> {
             jitter_frames,
             buffer_frames,
             bypass,
+            ort_lib,
         ),
     }
+}
+
+/// Fall back to the model directory that ships inside the `deepfilter-rt`
+/// checkout, recorded at build time, so a bare `voicemic bench` works.
+fn resolve_model(arg: Option<&Path>) -> Result<PathBuf> {
+    if let Some(p) = arg {
+        return Ok(p.to_path_buf());
+    }
+    if let Some(dir) = ort_setup::models_hint() {
+        let d = dir.join("dfn3_h0");
+        if d.is_dir() {
+            return Ok(d);
+        }
+    }
+    bail!(
+        "no model directory given and no bundled models were recorded at build time.\n\
+         Pass one explicitly, e.g. `voicemic bench /path/to/deepfilter-rt/models/dfn3_h0`."
+    )
 }
 
 #[cfg(feature = "audio")]
@@ -158,11 +215,18 @@ fn list_devices() -> Result<()> {
 
 #[cfg(feature = "dfn")]
 fn make_enhancer(
-    model: &std::path::Path,
+    model: &Path,
     mode: Mode,
     threads: usize,
+    ort_lib: Option<&Path>,
 ) -> Result<Box<dyn voicemic::enhancer::Enhancer>> {
     use deepfilter_rt::SessionMode;
+
+    // Load ONNX Runtime by absolute path before deepfilter-rt gets a chance to try
+    // its hardcoded leaf name. ort caches the handle in a OnceLock, so its later
+    // lookup finds the library already loaded and succeeds without a search path.
+    ort_setup::init(ort_lib)?;
+
     let sm = match mode {
         Mode::Combined => SessionMode::CombinedStreaming,
         Mode::Split => SessionMode::SplitStreaming,
@@ -176,12 +240,152 @@ fn make_enhancer(
 
 #[cfg(not(feature = "dfn"))]
 fn make_enhancer(
-    _model: &std::path::Path,
+    _model: &Path,
     _mode: Mode,
     _threads: usize,
+    _ort_lib: Option<&Path>,
 ) -> Result<Box<dyn voicemic::enhancer::Enhancer>> {
     bail!("built without the `dfn` feature")
 }
+
+// ---------------------------------------------------------------- doctor
+
+fn check(label: &str, ok: bool, detail: impl std::fmt::Display) -> bool {
+    println!("  [{}] {label}: {detail}", if ok { "ok" } else { "FAIL" });
+    ok
+}
+
+fn doctor(model: Option<&Path>, ort_lib: Option<&Path>) -> Result<()> {
+    println!("voicemic doctor");
+    println!(
+        "\nBuild\n  target: {} {}\n  features: audio={} dfn={}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(feature = "audio"),
+        cfg!(feature = "dfn"),
+    );
+
+    let mut all_ok = true;
+
+    println!("\nONNX Runtime");
+    match ort_setup::find_library(ort_lib) {
+        Some((path, source)) => {
+            // Reported, not asserted: existence is the check below.
+            check(
+                "candidate",
+                true,
+                format!("{} ({})", path.display(), source.describe()),
+            );
+            all_ok &= check(
+                "file exists",
+                path.exists(),
+                if path.exists() {
+                    "yes"
+                } else {
+                    "no - path is stale"
+                },
+            );
+            #[cfg(feature = "dfn")]
+            {
+                match ort_setup::init(ort_lib) {
+                    Ok((p, _)) => {
+                        all_ok &= check("loads", true, p.display());
+                    }
+                    Err(e) => {
+                        all_ok &= check("loads", false, format!("{e:#}"));
+                    }
+                }
+            }
+        }
+        None => {
+            all_ok &= check(
+                "candidate",
+                false,
+                "not found. Build once with `cargo build --release`, or pass --ort-lib",
+            );
+        }
+    }
+
+    println!("\nModels");
+    match model
+        .map(|m| m.to_path_buf())
+        .or_else(|| resolve_model(None).ok())
+    {
+        Some(dir) => {
+            let exists = dir.is_dir();
+            all_ok &= check("directory", exists, dir.display());
+            if exists {
+                let cfg = dir.join("config.ini");
+                all_ok &= check(
+                    "config.ini",
+                    cfg.is_file(),
+                    if cfg.is_file() { "present" } else { "missing" },
+                );
+                if let Ok(text) = std::fs::read_to_string(&cfg) {
+                    let la: Vec<&str> = text
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| {
+                            l.starts_with("conv_lookahead") || l.starts_with("df_lookahead")
+                        })
+                        .collect();
+                    check("lookahead", true, la.join(", "));
+                }
+                let combined = dir.join("combined_streaming.onnx").is_file();
+                check(
+                    "combined_streaming.onnx",
+                    combined,
+                    if combined {
+                        "present (--mode combined available)"
+                    } else {
+                        "absent - --mode combined will fall back"
+                    },
+                );
+            }
+        }
+        None => {
+            all_ok &= check("directory", false, "no model directory given or recorded");
+        }
+    }
+
+    #[cfg(feature = "dfn")]
+    if let Some(dir) = model
+        .map(|m| m.to_path_buf())
+        .or_else(|| resolve_model(None).ok())
+    {
+        if dir.is_dir() {
+            println!("\nInference");
+            match make_enhancer(&dir, Mode::Combined, 1, ort_lib) {
+                Ok(mut e) => {
+                    all_ok &= check("model loads", true, e.describe());
+                    let input = vec![0.0f32; HOP_SIZE];
+                    let mut out = vec![0.0f32; HOP_SIZE];
+                    match e.process_frame(&input, &mut out) {
+                        Ok(()) => all_ok &= check("one frame", true, "processed"),
+                        Err(err) => all_ok &= check("one frame", false, format!("{err:#}")),
+                    }
+                }
+                Err(e) => all_ok &= check("model loads", false, format!("{e:#}")),
+            }
+        }
+    }
+
+    #[cfg(feature = "audio")]
+    {
+        println!("\nCoreAudio");
+        all_ok &= voicemic::bridge::doctor_devices();
+    }
+
+    println!();
+    if all_ok {
+        println!("All checks passed.");
+        Ok(())
+    } else {
+        bail!("one or more checks failed (see FAIL lines above)")
+    }
+}
+
+// ---------------------------------------------------------------- bench / file
 
 /// Deterministic stand-in for speech: a few voiced-range harmonics plus noise.
 /// Content does not change inference cost for this architecture, but keeping it
@@ -203,7 +407,7 @@ fn synthetic(n: usize) -> Vec<f32> {
         .collect()
 }
 
-fn read_wav_mono_48k(path: &std::path::Path) -> Result<Vec<f32>> {
+fn read_wav_mono_48k(path: &Path) -> Result<Vec<f32>> {
     let mut r =
         hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
     let spec = r.spec();
@@ -237,13 +441,14 @@ fn read_wav_mono_48k(path: &std::path::Path) -> Result<Vec<f32>> {
 }
 
 fn bench(
-    model: PathBuf,
+    model: &Path,
     wav: Option<PathBuf>,
     frames: usize,
     mode: Mode,
     threads: usize,
+    ort_lib: Option<&Path>,
 ) -> Result<()> {
-    let mut enh = make_enhancer(&model, mode, threads)?;
+    let mut enh = make_enhancer(model, mode, threads, ort_lib)?;
     println!("Model: {}", enh.describe());
 
     let signal = match &wav {
@@ -286,12 +491,11 @@ fn bench(
         FRAME_DEADLINE_US / 1000
     );
 
-    let over = times.max_us() > FRAME_DEADLINE_US;
     println!(
         "\nWorst frame used {:.0}% of the deadline.",
         100.0 * times.max_us() as f64 / FRAME_DEADLINE_US as f64
     );
-    if over {
+    if times.max_us() > FRAME_DEADLINE_US {
         println!("Worst frame EXCEEDED the deadline: a jitter buffer of >=2 frames is required.");
     }
     println!(
@@ -301,15 +505,17 @@ fn bench(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn file(
-    model: PathBuf,
+    model: &Path,
     input: PathBuf,
     output: PathBuf,
     mode: Mode,
     threads: usize,
     align: bool,
+    ort_lib: Option<&Path>,
 ) -> Result<()> {
-    let mut enh = make_enhancer(&model, mode, threads)?;
+    let mut enh = make_enhancer(model, mode, threads, ort_lib)?;
     println!("Model: {}", enh.describe());
 
     let signal = read_wav_mono_48k(&input)?;
@@ -353,6 +559,8 @@ fn file(
     Ok(())
 }
 
+// ---------------------------------------------------------------- run
+
 #[cfg(feature = "audio")]
 #[allow(clippy::too_many_arguments)]
 fn run(
@@ -364,6 +572,7 @@ fn run(
     jitter_frames: usize,
     buffer_frames: Option<u32>,
     bypass: bool,
+    ort_lib: Option<PathBuf>,
 ) -> Result<()> {
     use voicemic::bridge::{self, BridgeConfig, SharedStats};
 
@@ -410,7 +619,7 @@ fn run(
         if bypass {
             Ok(Box::new(voicemic::enhancer::Passthrough))
         } else {
-            make_enhancer(&model, mode, threads)
+            make_enhancer(&model, mode, threads, ort_lib.as_deref())
         }
     };
 
@@ -444,6 +653,7 @@ fn run(
     _jitter_frames: usize,
     _buffer_frames: Option<u32>,
     _bypass: bool,
+    _ort_lib: Option<PathBuf>,
 ) -> Result<()> {
     bail!("built without the `audio` feature")
 }

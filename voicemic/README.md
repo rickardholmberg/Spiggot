@@ -48,60 +48,76 @@ before drawing conclusions.
 cargo build --release
 ```
 
-The `ort` build script downloads ONNX Runtime on first build.
+The `ort` build script downloads ONNX Runtime on first build, and `build.rs`
+records where it landed along with the model directory that ships inside the
+`deepfilter-rt` checkout. Nothing else is needed for `bench`, `file` or `doctor` --
+no separate model clone, and no environment variables.
 
-### 2. Make ONNX Runtime loadable
-
-`deepfilter-rt` calls `ort::init_from("libonnxruntime")` with a hardcoded leaf
-name and ignores `ORT_DYLIB_PATH`. The shipped file is `libonnxruntime.dylib`,
-which `dlopen` will not resolve from that name, so an otherwise correct build
-fails at first use. Run:
+### 2. Check
 
 ```sh
-./scripts/ort_env.sh
+./target/release/voicemic doctor
 ```
 
-and add the `export DYLD_LIBRARY_PATH=...` line it prints to your shell. It must
-be set before launching `voicemic`: the dynamic loader reads it at process start.
+Reports the runtime it found and how, the model directory and its lookahead
+settings, whether one frame actually processes, and on macOS the CoreAudio devices
+and microphone permission. Every FAIL line says what to do.
 
-### 3. Get the models
-
-The model directories ship in the `deepfilter-rt` repository, not in the crate:
-
-```sh
-git clone --depth 1 https://github.com/shimondoodkin/deepfilter-rt /tmp/dfrt
-```
-
-Use `/tmp/dfrt/models/dfn3_h0` and friends as the `<model>` argument.
-
-### 4. Install BlackHole
+### 3. Install BlackHole (only for `run`)
 
 ```sh
 brew install --cask blackhole-2ch
 ```
 
-Only needed for `run`. `bench` and `file` work without it. BlackHole is a
-loopback device: `voicemic` writes to its output side, and Zoom selects it as a
-microphone. This is Phase 2 of the plan; Phase 3 replaces it with a real virtual
-input device built on libASPL, which removes the dependency.
+BlackHole is a loopback device: `voicemic` writes to its output side and Zoom
+selects it as a microphone. This is Phase 2 of the plan; Phase 3 replaces it with a
+real virtual input device built on libASPL, which removes the dependency.
+
+### On finding ONNX Runtime
+
+`deepfilter-rt` calls `ort::init_from("libonnxruntime")` with a hardcoded leaf name
+and ignores `ORT_DYLIB_PATH`, so it depends on the dynamic loader finding a file
+under that exact name. That cannot be made reliable on macOS: SIP strips `DYLD_*`
+from the environment whenever a protected system binary runs, and that includes the
+shell, so a search path exported by the user never reaches a binary launched from a
+script. It also breaks under the hardened runtime the signed `.app` will need for
+microphone access.
+
+`voicemic` sidesteps this by loading the library itself, by absolute path, before
+`deepfilter-rt` gets a chance to look. `ort` caches the handle in a `OnceLock`, so
+its later lookup finds the library already loaded and succeeds. Resolution order:
+`--ort-lib`, then `ORT_DYLIB_PATH` (which `voicemic` honours even though
+`deepfilter-rt` does not), then the path recorded at build time, then a search of
+the executable directory and the Homebrew prefixes.
+
+If discovery ever fails, pass the path explicitly:
+
+```sh
+voicemic --ort-lib /path/to/libonnxruntime.dylib doctor
+```
 
 ## Usage
 
-```sh
-# Phase 1 gate: what does a frame cost on this machine?
-voicemic bench /tmp/dfrt/models/dfn3_h0 --mode combined --threads 1
+Model defaults to the bundled `dfn3_h0`; pass a directory to override.
 
-# All variants and modes.
-./scripts/bench_matrix.sh /tmp/dfrt/models
+```sh
+# Check every precondition first.
+voicemic doctor
+
+# Phase 1 gate: what does a frame cost on this machine?
+voicemic bench --mode combined --threads 1
+
+# All variants and modes. Takes a models directory, or none for the bundled one.
+./scripts/bench_matrix.sh /path/to/deepfilter-rt/models
 
 # Fidelity check against upstream `deep-filter -D`.
-voicemic file /tmp/dfrt/models/dfn3_h0 in48k.wav out.wav --align
+voicemic file in48k.wav out.wav --align
 
 # Live: microphone -> DeepFilterNet -> BlackHole.
-voicemic run /tmp/dfrt/models/dfn3_h0 --jitter-frames 2
+voicemic run --jitter-frames 2
 
 # Control case: same bridge, no model. Isolates bridge cost from model cost.
-voicemic run /tmp/dfrt/models/dfn3_h0 --bypass
+voicemic run --bypass
 ```
 
 Then set BlackHole 2ch as the microphone in Zoom/Teams/OBS.
@@ -168,7 +184,7 @@ Device I/O (`bridge.rs`) sits behind the `audio` feature and inference behind
 - `deepfilter-rt` is pinned by revision; it is not published to crates.io.
 - Microphone permission: a bare binary run from Terminal inherits Terminal's TCC
   grant. Wrap it in a signed `.app` with `NSMicrophoneUsageDescription` before
-  judging results.
+  judging results. `voicemic doctor` opens an input stream to check this for real.
 - The `coreml` feature routes ONNX Runtime through CoreML. Measure before
   enabling: at 100 frames/s, per-call dispatch overhead can lose to plain CPU for
   a model this small.

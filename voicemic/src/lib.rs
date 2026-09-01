@@ -10,6 +10,9 @@ pub mod delay;
 pub mod drift;
 pub mod stats;
 
+/// Locating and loading ONNX Runtime without relying on shell environment.
+pub mod ort_setup;
+
 /// DeepFilterNet operates at a fixed 48 kHz.
 pub const SAMPLE_RATE: u32 = 48_000;
 /// Frame size accepted by `DeepFilterProcessor::process_frame`.
